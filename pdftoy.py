@@ -5,7 +5,7 @@ from contextlib import closing
 import fitz  # PyMuPDF
 
 # ================= 全局元数据与配置开关 =================
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 DEBUG_TOC = False  # True: 打印提取到的原始书签，方便调试奇葩 PDF
 STRICT_TOC = False  # True: 开启严格模式，提高书签判定门槛
@@ -128,6 +128,14 @@ def find_best_ref_page(doc, start=2, end=15, min_size_pt=400):
     return min(4, total - 1)
 
 
+# ============================================================
+# 两种页面标准化实现（单页处理）
+#   method="matrix" : insert_pdf 整本复制 + cm 仿射矩阵包裹内容流
+#   method="reflow" : 逐页 new_page + show_pdf_page(clip=...) 重渲染
+# 两者均保证图片型 / 文字型 PDF 零飘移（matrix 额外保留超链接）
+# ============================================================
+
+
 def _compute_page_matrix(page, target_w, target_h, fit_width, page_index=None):
     """计算单页的变换矩阵与目标高度（纯计算，不修改文档）
 
@@ -208,14 +216,138 @@ def _rebuild_named_links(src_doc, dst_doc):
     return rebuilt
 
 
+def _apply_matrix_page(
+    dst_doc, page, i, target_w, target_h, fit_width, page_matrices=None
+):
+    """Matrix 方法：对已整本 insert_pdf 复制的第 i 页做 cm 矩阵包裹"""
+    src_box = page.rect
+    orig_w = src_box.width
+    orig_h = src_box.height
+
+    if page_matrices:
+        m, new_h = page_matrices[i]
+    else:
+        m, new_h = _compute_page_matrix(page, target_w, target_h, fit_width, i)
+
+    new_page = dst_doc[i]
+
+    # 用 cm (concat matrix) 算子包裹原始内容流，并裁剪到源 mediabox，
+    # 精确复刻 show_pdf_page(clip=page.rect) 的渲染结果（防止溢出/飘移）
+    old_content = new_page.read_contents()
+    mat_cm = f"{m.a} {m.b} {m.c} {m.d} {m.e} {m.f} cm"
+    clip_path = f"0 0 {orig_w} {orig_h} re W n"
+    wrapped = (
+        b"q\n"
+        + mat_cm.encode("latin-1")
+        + b"\n"
+        + clip_path.encode("latin-1")
+        + b"\n"
+        + old_content
+        + b"\nQ\n"
+    )
+
+    # 必须为每一页分配[独立]的内容流 xref，只在本页私有副本上包裹一次。
+    # 源 PDF 常把「薄壳」内容流（如 q /fzFrm0 Do Q）在数百页间共享同一 xref。
+    # 若直接 update_stream 改写该共享 xref，后续页面会再次包裹，导致 cm 矩阵
+    # 被反复嵌套复合（实测可达数百层），内容严重飘移。
+    new_xref = dst_doc.get_new_xref()
+    dst_doc.update_object(new_xref, "<<>>")
+    dst_doc.update_stream(new_xref, wrapped, compress=True)
+    new_page.set_contents(new_xref)
+
+    # 统一画布尺寸（同时对齐 CropBox，避免源 cropbox 偏移导致显示区域被裁剪/错位）
+    unified_box = fitz.Rect(0, 0, target_w, new_h)
+    new_page.set_mediabox(unified_box)
+    # 关键：cropbox 必须用「写入后的 mediabox」而非原始 unified_box。
+    # 因 set_mediabox 按字符串格式四舍五入存储，self.mediabox 读回值与
+    # full-precision 的 unified_box 在新高度(new_h 为 orig_h*s 计算值)场景下
+    # 可能存在 ~1e-5 差异，若用原始 unified_box 传 set_cropbox，_set_pagebox
+    # 内 rect.y0 = mb.y1 - ub.y1 会算出微小负值 -> 误报 "CropBox not in MediaBox"
+    # （fit-width 模式特有，固定画布 new_h=target_h 能干净往返故未暴露）。
+    new_page.set_cropbox(new_page.mediabox)
+
+    # 同步变换超链接坐标：链接矩形是独立注释对象，cm 包裹内容流不会带动它，
+    # 必须用同一矩阵 m 把每条链接的矩形（及文本链接的 QuadPoints）搬到新画布位置。
+    for link in new_page.get_links():
+        link_rect = fitz.Rect(link["from"])
+        link["from"] = link_rect * m
+        # 变换跳转目标点（"to"）：目标页的内容也被同一矩阵缩放了，
+        # 若不变换 to 坐标，点击链接跳转后定位会偏移。
+        to_point = link.get("to")
+        target_pg = link.get("page")
+        if to_point is not None and target_pg is not None and page_matrices:
+            if 0 <= target_pg < len(page_matrices):
+                target_m = page_matrices[target_pg][0]
+                link["to"] = fitz.Point(to_point) * target_m
+        if link.get("quad"):
+            link["quad"] = [fitz.Point(p) * m for p in link["quad"]]
+        new_page.update_link(link)
+
+
+def _apply_reflow_page(dst_doc, src_doc, page, i, target_w, target_h, fit_width):
+    """Reflow 方法（旧版 show_pdf_page）：逐页 new_page + show_pdf_page 重渲染"""
+    src_box = page.rect
+    orig_w = src_box.width
+    orig_h = src_box.height
+
+    if fit_width:
+        if orig_w <= 0:
+            orig_w = target_w
+
+        scale = target_w / orig_w
+        calculated_h = orig_h * scale
+        new_h = max(MIN_PAGE_HEIGHT, min(calculated_h, MAX_PAGE_HEIGHT))
+
+        if calculated_h > MAX_PAGE_HEIGHT or calculated_h < MIN_PAGE_HEIGHT:
+            log(
+                f"第 {i + 1} 页等比高度 ({calculated_h:.1f}pt) 触发安全限制，"
+                f"修正为: {new_h:.1f}pt",
+                Level.WARN,
+            )
+
+        new_page = dst_doc.new_page(width=target_w, height=new_h)
+        fit_rect = fitz.Rect(0, 0, target_w, new_h)
+        new_page.show_pdf_page(fit_rect, src_doc, i, clip=src_box)
+
+        unified_box = fitz.Rect(0, 0, target_w, new_h)
+        new_page.set_mediabox(unified_box)
+    else:
+        new_page = dst_doc.new_page(width=target_w, height=target_h)
+
+        scale_w = target_w / orig_w if orig_w > 0 else 1.0
+        scale_h = target_h / orig_h if orig_h > 0 else 1.0
+        s = min(scale_w, scale_h)
+
+        scaled_w = orig_w * s
+        scaled_h = orig_h * s
+
+        dx = (target_w - scaled_w) / 2.0
+        dy = (target_h - scaled_h) / 2.0
+
+        fit_rect = fitz.Rect(dx, dy, dx + scaled_w, dy + scaled_h)
+        new_page.show_pdf_page(fit_rect, src_doc, i, clip=src_box)
+
+        unified_box = fitz.Rect(0, 0, target_w, target_h)
+        new_page.set_mediabox(unified_box)
+
+
 def fix_pdf_scale_pro_module(
     input_pdf_path: str,
     output_pdf_path: str,
     auto_ref: bool = True,
     ref_page_index: int | None = None,
     fit_width: bool = False,
+    method: str = "matrix",
 ) -> dict:
-    """全功能、可编程、工业级 PDF 页面标准化处理主函数"""
+    """全功能、可编程、工业级 PDF 页面标准化处理主函数
+
+    method:
+        "matrix" (默认) -> insert_pdf 整本复制 + cm 矩阵包裹，保留文字/图片/矢量/超链接
+        "reflow"        -> 逐页 new_page + show_pdf_page 重渲染（旧版方法）
+    """
+    if method not in ("matrix", "reflow"):
+        raise ValueError(f"未知的渲染方法: {method!r}（应为 'matrix' 或 'reflow'）")
+
     with (
         closing(fitz.open(input_pdf_path)) as src_doc,
         closing(fitz.open()) as dst_doc,
@@ -255,126 +387,46 @@ def fix_pdf_scale_pro_module(
                 Level.INFO,
             )
 
-        # 页面标准化处理（Matrix 方法）
-        # 一次性整本文档 insert_pdf 向量复制（共享资源只存一份，避免逐页复制导致体积膨胀/卡死）
-        # 再逐页用 cm 仿射矩阵包裹内容流实现统一缩放+居中
-        # 配合 use_objstms + deflate + garbage=1 保存策略
-        # 原理：insert_pdf 完整复制源页面（保留文字/图片/矢量、共享资源），
-        #       通过在内容流前缀加 cm 仿射矩阵实现统一缩放+居中，
-        #       保证图片型 PDF 和文字型 PDF 均零飘移
-        # 关键：必须整本文档一次性 insert_pdf，而非逐页 insert_pdf ——
-        #       逐页复制会把字体等资源每页各存一份，输出体积暴涨数倍，
-        #       且后续 garbage=3 去重需重压全部字体而卡死
-        # links=True → 保留源 PDF 的超链接（内部跳转/URI）
-        # 注意：链接注释的坐标是独立的 /Annots 对象，不会被内容流的 cm 变换带动，
-        #       因此下方循环内会用同一矩阵 m 同步变换每条链接的矩形（见 link 处理段）
-        dst_doc.insert_pdf(
-            src_doc,
-            annots=False,
-            links=True,
-            widgets=False,
+        log(
+            f"【渲染方法】{'matrix 矩阵（推荐，保留超链接）' if method == 'matrix' else 'reflow 旧版 show_pdf_page'}",
+            Level.INFO,
         )
-        # 预计算所有页变换矩阵（供链接 to 点坐标变换共用）
-        page_matrices = [
-            _compute_page_matrix(page, target_w, target_h, fit_width, i)
-            for i, page in enumerate(src_doc)
-        ]
-        named_links_count = _rebuild_named_links(src_doc, dst_doc)
 
-        for i, page in enumerate(src_doc):
-            src_box = page.rect
-            orig_w = src_box.width
-            orig_h = src_box.height
-
-            if fit_width:
-                if orig_w <= 0:
-                    orig_w = target_w
-
-                scale = target_w / orig_w
-                calculated_h = orig_h * scale
-                new_h = max(MIN_PAGE_HEIGHT, min(calculated_h, MAX_PAGE_HEIGHT))
-
-                if calculated_h > MAX_PAGE_HEIGHT or calculated_h < MIN_PAGE_HEIGHT:
-                    log(
-                        f"第 {i + 1} 页等比高度 ({calculated_h:.1f}pt) 触发安全限制，"
-                        f"修正为: {new_h:.1f}pt",
-                        Level.WARN,
-                    )
-
-                # Matrix: 按宽度等比缩放，原点对齐（左上角）
-                s = scale
-                dx = 0.0
-                dy = 0.0
-            else:
-                scale_w = target_w / orig_w if orig_w > 0 else 1.0
-                scale_h = target_h / orig_h if orig_h > 0 else 1.0
-                s = min(scale_w, scale_h)
-
-                dx = (target_w - orig_w * s) / 2.0
-                dy = (target_h - orig_h * s) / 2.0
-                new_h = target_h
-
-            # 页面已通过整本 insert_pdf 复制，直接取对应页（资源共享，无重复）
-            new_page = dst_doc[i]
-
-            # 仿射变换矩阵（已由 page_matrices 预计算，含 cropbox 原点偏移）
-            m, new_h = page_matrices[i]
-
-            # 用 cm (concat matrix) 算子包裹原始内容流，并裁剪到源 mediabox，
-            # 精确复刻 show_pdf_page(clip=page.rect) 的渲染结果（防止溢出/飘移）
-            old_content = new_page.read_contents()
-            mat_cm = f"{m.a} {m.b} {m.c} {m.d} {m.e} {m.f} cm"
-            clip_path = f"0 0 {orig_w} {orig_h} re W n"
-            wrapped = (
-                b"q\n"
-                + mat_cm.encode("latin-1")
-                + b"\n"
-                + clip_path.encode("latin-1")
-                + b"\n"
-                + old_content
-                + b"\nQ\n"
+        # matrix 方法需整本一次性 insert_pdf（共享资源只存一份，避免逐页复制导致体积膨胀/卡死）
+        # 再逐页用 cm 仿射矩阵包裹内容流实现统一缩放+居中
+        # reflow 方法逐页 new_page + show_pdf_page，无需预复制
+        page_matrices = None
+        named_links_count = 0
+        if method == "matrix":
+            dst_doc.insert_pdf(
+                src_doc,
+                annots=False,
+                links=True,
+                widgets=False,
             )
 
-            # 关键修正：必须为每一页分配【独立】的内容流 xref，只在本页私有副本上包裹一次。
-            # 源 PDF 常把「薄壳」内容流（如 q /fzFrm0 Do Q）在数百页间共享同一 xref。
-            # 若直接 update_stream 改写该共享 xref，后续页面处理时又读回已包裹过的内容再次包裹，
-            # 导致 cm 矩阵被反复嵌套复合（实测可达数百层），内容严重飘移。
-            # 因此先 get_new_xref 新建私有流，再 set_contents 把本页 /Contents 指向它。
-            new_xref = dst_doc.get_new_xref()
-            dst_doc.update_object(new_xref, "<<>>")
-            dst_doc.update_stream(new_xref, wrapped, compress=True)
-            new_page.set_contents(new_xref)
+            # 预计算所有页面的变换矩阵（供内容流包裹与链接 to 点坐标变换共用）
+            page_matrices = [
+                _compute_page_matrix(page, target_w, target_h, fit_width, i)
+                for i, page in enumerate(src_doc)
+            ]
 
-            # 统一画布尺寸（同时对齐 CropBox，避免源 cropbox 偏移导致显示区域被裁剪/错位）
-            unified_box = fitz.Rect(0, 0, target_w, new_h)
-            new_page.set_mediabox(unified_box)
-            # 关键：cropbox 必须用「写入后的 mediabox」而非原始 unified_box。
-            # 因 set_mediabox 按字符串格式四舍五入存储，self.mediabox 读回值与
-            # full-precision 的 unified_box 在新高度(new_h 为 orig_h*s 计算值)场景下
-            # 可能存在 ~1e-5 差异，若用原始 unified_box 传 set_cropbox，_set_pagebox
-            # 内 rect.y0 = mb.y1 - ub.y1 会算出微小负值 -> 误报 "CropBox not in MediaBox"
-            # （fit-width 模式特有，固定画布 new_h=target_h 能干净往返故未暴露）。
-            # 取写入后的 mediabox 可保证 cropbox 与 mediabox 严格相等、必然包含。
-            new_page.set_cropbox(new_page.mediabox)
+            # 重建 NAMED 链接为 GOTO 类型
+            # insert_pdf(links=True) 不复制 NAMED 链接——这类链接引用 /Names 命名目标
+            # 字典，而 insert_pdf 不会复制该字典，导致目录超链接全部丢失。
+            # 此处从源文档读取已解析的 NAMED 链接，以 GOTO 类型重新插入目标文档。
+            named_links_count = _rebuild_named_links(src_doc, dst_doc)
 
-            # 同步变换超链接坐标：链接矩形是独立注释对象，cm 包裹内容流不会带动它，
-            # 必须用同一矩阵 m 把每条链接的矩形（及文本链接的 QuadPoints）搬到新画布位置，
-            # 否则链接停留在旧坐标、点击区域错位
-            for link in new_page.get_links():
-                link_rect = fitz.Rect(link["from"])
-                link["from"] = link_rect * m
-                # 变换跳转目标点（"to"）：目标页内容同样被矩阵缩放，不变换则跳转定位偏移
-                to_point = link.get("to")
-                target_pg = link.get("page")
-                if (
-                    to_point is not None
-                    and target_pg is not None
-                    and 0 <= target_pg < len(page_matrices)
-                ):
-                    link["to"] = fitz.Point(to_point) * page_matrices[target_pg][0]
-                if link.get("quad"):
-                    link["quad"] = [fitz.Point(p) * m for p in link["quad"]]
-                new_page.update_link(link)
+        # 逐页标准化处理
+        for i, page in enumerate(src_doc):
+            if method == "matrix":
+                _apply_matrix_page(
+                    dst_doc, page, i, target_w, target_h, fit_width, page_matrices
+                )
+            else:
+                _apply_reflow_page(
+                    dst_doc, src_doc, page, i, target_w, target_h, fit_width
+                )
 
         # 书签识别与过滤
         log("开始书签树提取与健康度诊断", Level.INFO)
@@ -429,15 +481,14 @@ def fix_pdf_scale_pro_module(
             injected_count = len(valid_toc)
 
         # 保存策略：
-        # use_objstms=True → 对象流压缩，匹配源 PDF 存储方式
-        # deflate=True       → 压缩未压缩流数据
-        # garbage=1          → 回收未用对象 + 紧凑化（不重写内容流，避免大文件卡死）
-        # 实测效果：因采用整本 insert_pdf 共享资源，输出体积已小于原始文件，零页面偏移且不卡死
+        # matrix -> garbage=1（整本 insert_pdf 已共享资源，回收未用对象即可，避免大文件卡死）
+        # reflow -> garbage=3（逐页重渲染，需去重 + 紧凑化体积）
+        garbage_level = 1 if method == "matrix" else 3
         dst_doc.save(
             output_pdf_path,
             use_objstms=True,
             deflate=True,
-            garbage=1,
+            garbage=garbage_level,
         )
         log(f"处理完成，文件成功保存至: {output_pdf_path}", Level.OK)
 
@@ -445,13 +496,14 @@ def fix_pdf_scale_pro_module(
             "output_path": output_pdf_path,
             "total_pages": total_pages,
             "ref_page_index": chosen_ref_index,
+            "method": method,
             "fit_width": fit_width,
             "target_size_pt": (round(target_w, 2), round(target_h, 2)),
             "toc_injected": bool(injected_count > 0),
             "toc_mode": used_mode,
             "toc_count": injected_count,
             "toc_health_score": final_health_score,
-            "named_links_rebuilt": named_links_count,
+            "named_links_rebuilt": named_links_count if method == "matrix" else 0,
         }
 
 
@@ -461,8 +513,9 @@ def main():
         prog="pdftoy.exe",
         description=(
             "PDF 页面尺寸统一工具\n"
-            "【默认模式】: 固定参考页画布尺寸，将所有页面缩放居中。\n"
-            "【按宽模式】: 添加 -w / --fit-width 参数，统一页面宽度，高度等比例自适应。"
+            "【默认模式】: matrix 矩阵方法（insert_pdf + cm 包裹，零飘移且保留超链接）\n"
+            "【旧版模式】: 加 -l / --legacy 使用 show_pdf_page 重渲染方法\n"
+            "【画布模式】: 默认固定参考页画布尺寸；加 -w 按宽度适配（高度等比例自适应）"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
@@ -486,6 +539,12 @@ def main():
         type=int,
         metavar="PAGE_NUM",
         help="指定基准参考页码（从 1 开始计算，默认自动探测）",
+    )
+    parser.add_argument(
+        "-l",
+        "--legacy",
+        action="store_true",
+        help="使用旧版 show_pdf_page 重渲染方法（默认：matrix 矩阵方法，推荐）。",
     )
     parser.add_argument(
         "-V",
@@ -516,6 +575,8 @@ def main():
         auto_ref = True
         ref_index = None
 
+    method = "reflow" if args.legacy else "matrix"
+
     try:
         fix_pdf_scale_pro_module(
             input_pdf_path=input_path,
@@ -523,6 +584,7 @@ def main():
             auto_ref=auto_ref,
             ref_page_index=ref_index,
             fit_width=args.fit_width,
+            method=method,
         )
     except Exception as e:
         log(f"{e}", Level.ERROR)

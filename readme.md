@@ -8,6 +8,7 @@
 
 - 参考页默认自动探测：扫描前若干页里频次最高的正文尺寸页
 - 也支持 `-p` 手动指定参考页码，跳过自动探测
+- 默认 matrix 方法（整本复制 + 矩阵包裹）保持零飘移并保留超链接；加 `-l` 可退回旧版 show_pdf_page 重渲染
 - 日志分五个级别（INFO / OK / WARN / ERROR / DEBUG），可用 Emoji 或纯文本前缀
 - 单文件命令行工具，不含图形界面
 
@@ -18,6 +19,7 @@ python pdftoy.py 输入.pdf                   # 自动探测参考页
 python pdftoy.py 输入.pdf -o 输出.pdf       # 指定输出路径
 python pdftoy.py 输入.pdf -p 3              # 手动指定第 3 页为参考页
 python pdftoy.py 输入.pdf -w                # 按宽度适配，高度按原比例自适应
+python pdftoy.py 输入.pdf -l                # 旧版重渲染方法（默认 matrix）
 python pdftoy.py --version                  # 查看版本号
 ```
 
