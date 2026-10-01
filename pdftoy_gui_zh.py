@@ -3,7 +3,7 @@
 pdftoy GUI — PDF 页面尺寸统一工具 · 图形界面
 
 基于 pdftoy.py 核心模块，提供直观的图形操作界面。
-零额外依赖（tkinter 随 Python 标准库附带）。
+仅依赖 tkinter（随 Python 标准库附带）与 sv_ttk 主题包。
 
 用法:
     python pdftoy_gui.py
@@ -16,6 +16,8 @@ import threading
 import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
+
+import sv_ttk
 
 import pdftoy_zh
 from pdftoy_zh import fix_pdf_scale_pro_module, Level, LEVEL_STYLE, __version__
@@ -51,47 +53,22 @@ class App:
     #  样式
     # ================================================================
     def _setup_style(self):
-        style = ttk.Style()
         try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
+            sv_ttk.set_theme("light")
+        except Exception as e:
+            print(f"主题加载失败: {e}")
 
-        bg = "#ffffff"
-        card_bg = "#ffffff"
-        accent = "#2563eb"
-        accent_hover = "#1d4ed8"
-
-        self.root.configure(bg=bg)
-
+        style = ttk.Style()
         font_family = "Microsoft YaHei UI"
 
-        style.configure("TFrame", background=bg)
-        style.configure("TLabel", background=bg, foreground="#1f2937", font=(font_family, 10))
-        style.configure("Title.TLabel", background=bg, foreground="#111827", font=(font_family, 18, "bold"))
-        style.configure("Subtitle.TLabel", background=bg, foreground="#6b7280", font=(font_family, 9))
-        style.configure("TLabelframe", background=card_bg, foreground="#374151", font=(font_family, 10, "bold"))
-        style.configure("TLabelframe.Label", background=card_bg, foreground="#374151")
-
-        style.configure("TButton", font=(font_family, 10), padding=(12, 6), borderwidth=0)
-        style.configure("Accent.TButton", font=(font_family, 12, "bold"), padding=(20, 10),
-                        background=accent, foreground="white", borderwidth=0)
-        style.map("Accent.TButton",
-                  background=[("active", accent_hover), ("pressed", accent_hover), ("disabled", "#9ca3af")],
-                  foreground=[("active", "white"), ("disabled", "#e5e7eb")])
-
-        style.configure("TRadiobutton", background=card_bg, foreground="#1f2937", font=(font_family, 10))
-        style.map("TRadiobutton", background=[("active", card_bg)])
-
+        style.configure("Title.TLabel", font=(font_family, 18, "bold"))
+        style.configure("Subtitle.TLabel", font=(font_family, 9))
+        style.configure("TLabelframe", font=(font_family, 10, "bold"))
+        style.configure("TButton", font=(font_family, 10), padding=(12, 6))
+        style.configure("Accent.TButton", font=(font_family, 12, "bold"), padding=(20, 10))
+        style.configure("TRadiobutton", font=(font_family, 10))
         style.configure("TEntry", font=(font_family, 10))
-        style.configure("TSpinbox", font=(font_family, 10), fieldbackground="white",
-                        background="#f5f5f5", arrowsize=11, lightcolor="#f5f5f5", darkcolor="#f5f5f5", )
-        style.map("TSpinbox", fieldbackground=[("disabled", "#f5f5f5"), ],
-                  background=[("active", "#e5e7eb"), ("pressed", "#d1d5db"), ], lightcolor=[("active", "#e5e7eb"), (
-                "pressed", "#d1d5db"), ], darkcolor=[("active", "#e5e7eb"), ("pressed", "#d1d5db"), ],
-                  arrowcolor=[("active", "#2563eb"), ("pressed", "#1d4ed8"), ("disabled", "#9ca3af"), ], )
-
-        style.configure("Horizontal.TProgressbar", thickness=4, background=accent, troughcolor="#e5e7eb")
+        style.configure("TSpinbox", font=(font_family, 10))
 
     # ================================================================
     #  构建 UI
@@ -114,7 +91,7 @@ class App:
         # 输入行
         row1 = ttk.Frame(file_frame)
         row1.pack(fill="x", pady=(0, 8))
-        ttk.Label(row1, text="输入 PDF", width=8).pack(side="left")
+        ttk.Label(row1, text="输入 PDF", width=9).pack(side="left")
         self.input_var = tk.StringVar()
         self.input_entry = ttk.Entry(row1, textvariable=self.input_var)
         self.input_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
@@ -123,7 +100,7 @@ class App:
         # 输出行
         row2 = ttk.Frame(file_frame)
         row2.pack(fill="x")
-        ttk.Label(row2, text="输出 PDF", width=8).pack(side="left")
+        ttk.Label(row2, text="输出 PDF", width=9).pack(side="left")
         self.output_var = tk.StringVar()
         self.output_entry = ttk.Entry(row2, textvariable=self.output_var)
         self.output_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
@@ -415,7 +392,11 @@ class App:
             self.open_file_btn.config(state="normal")
             self.open_folder_btn.config(state="normal")
 
-        size_kb = os.path.getsize(self.last_output_path) / 1024 if self.last_output_path else 0
+        size_kb = (
+            os.path.getsize(self.last_output_path) / 1024
+            if self.last_output_path and os.path.isfile(self.last_output_path)
+            else 0
+        )
         self._set_status(
             f"完成 — {result['total_pages']} 页 · "
             f"画布 {result['target_size_pt'][0]:.0f}×{result['target_size_pt'][1]:.0f}pt · "

@@ -9,7 +9,7 @@ except ImportError:
     import fitz  # PyMuPDF (legacy fallback for older versions)
 
 # ================= 全局元数据与配置开关 =================
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 DEBUG_TOC = False  # True: 打印提取到的原始书签，方便调试奇葩 PDF
 STRICT_TOC = False  # True: 开启严格模式，提高书签判定门槛

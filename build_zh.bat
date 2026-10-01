@@ -5,7 +5,7 @@ if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 
 echo Building pdftoy Chinese GUI executable (windowed)...
-".venv\Scripts\pyinstaller.exe" --upx-dir .venv\Scripts --onefile --windowed --name pdftoy-gui-zh --icon=pdftoy.ico --exclude-module pandas --exclude-module numpy --exclude-module fontTools --exclude-module PIL --exclude-module cppyy --exclude-module mupdf_cppyy --exclude-module pymupdf_table pdftoy_gui_zh.py
+".venv\Scripts\pyinstaller.exe" --add-data=".venv/Lib/site-packages/sv_ttk:sv_ttk" --upx-dir .venv\Scripts --onefile --windowed --name pdftoy-gui-zh --icon=pdftoy.ico --exclude-module pandas --exclude-module numpy --exclude-module fontTools --exclude-module PIL --exclude-module cppyy --exclude-module mupdf_cppyy --exclude-module pymupdf_table pdftoy_gui_zh.py
 
 echo.
 echo Building pdftoy Chinese CLI executable (console)...

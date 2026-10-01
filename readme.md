@@ -35,16 +35,17 @@ python pdftoy_gui.py                        # 启动图形界面（中文版 pdf
 | --- | --- | --- |
 | Python | 3.10+ | 推荐 3.12（源码用了 `X \| None` 注解） |
 | PyMuPDF | 1.24+ | `import pymupdf`；旧版用 `import fitz` 兼容 |
+| sv-ttk | 2.x | 仅图形界面需要（GUI 主题，1.0.1 引入）；只用命令行可以忽略 |
 
 ```bash
 python -m venv .venv
-.venv\Scripts\python -m pip install pymupdf
+.venv\Scripts\python -m pip install pymupdf sv-ttk
 ```
 
 ## 编译（打包成 exe）
 
 ```
-.venv\Scripts\python -m pip install pyinstaller pymupdf
+.venv\Scripts\python -m pip install pyinstaller pymupdf sv-ttk
 build.bat
 ```
 
