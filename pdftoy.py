@@ -5,13 +5,16 @@ from contextlib import closing
 import fitz  # PyMuPDF
 
 # ================= 全局元数据与配置开关 =================
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 DEBUG_TOC = False  # True: 打印提取到的原始书签，方便调试奇葩 PDF
 STRICT_TOC = False  # True: 开启严格模式，提高书签判定门槛
 USE_EMOJI = True  # True: 使用 Emoji 前缀；False: 使用兼容性文本前缀
 
-# 高度安全边界保护（单位：pt）
+# 书签诊断与性能优化常量
+EARLY_STOP_THRESHOLD = 0.85  # 极高品质标准：已扫描样本达到此比例时直接触发提前终止
+
+# 高度安全边界保护（单位：pt，仅在 fit_width 为 True 时生效）
 MIN_PAGE_HEIGHT = 100.0  # 约 3.5 cm
 MAX_PAGE_HEIGHT = 5000.0  # 约 1.76 米（防御天量内存爆破）
 # =======================================================
@@ -35,7 +38,7 @@ LEVEL_STYLE = {
 }
 
 
-def log(msg, level=Level.INFO):
+def log(msg: str, level: str = Level.INFO):
     """解耦日志输出逻辑，支持 Emoji/纯文本自动适配与防错兜底"""
     prefix = LEVEL_STYLE.get(level, f"[{level}]")
     print(f"{prefix} {msg}")
@@ -45,33 +48,31 @@ def log(msg, level=Level.INFO):
 
 
 def calculate_toc_health(toc):
-    """计算书签健康度得分 (0 - 100)"""
-    if not toc:
+    """高效计算书签健康度得分 (0 - 100)"""
+    total = len(toc)
+    if total == 0:
         return 0, 0.0
 
     meaningful_score = 0.0
+    junk_keywords = (
+        "page",
+        "link",
+        "img",
+        "doc",
+        "figure",
+        "uncategorized",
+        "anchor",
+    )
 
-    for item in toc:
+    for idx, item in enumerate(toc):
         level = item[0]
         title = str(item[1]).strip()
-        t_lower = title.lower()
 
-        if title.isdigit():
+        if len(title) < 2 or title.isdigit():
             continue
-        if any(
-            k in t_lower
-            for k in (
-                "page",
-                "link",
-                "img",
-                "doc",
-                "figure",
-                "uncategorized",
-                "anchor",
-            )
-        ):
-            continue
-        if len(title) < 2:
+
+        t_lower = title.lower()
+        if any(k in t_lower for k in junk_keywords):
             continue
 
         score = 1.0
@@ -82,13 +83,19 @@ def calculate_toc_health(toc):
 
         meaningful_score += max(0.0, score)
 
-    ratio = meaningful_score / len(toc)
+        if idx > 50 and (idx % 20 == 0):
+            scanned = idx + 1
+            current_ratio = meaningful_score / scanned
+            if current_ratio >= EARLY_STOP_THRESHOLD:
+                return min(100, int(current_ratio * 100)), current_ratio
+
+    ratio = meaningful_score / total
     health_score = min(100, int(ratio * 100))
     return health_score, ratio
 
 
-def find_best_ref_page(doc, start=2, end=15, min_width_pt=400):
-    """自动选择最优参考页（以目标标准宽度为主指标）"""
+def find_best_ref_page(doc, start=2, end=15, min_size_pt=400):
+    """自动选择最优参考页"""
     total = len(doc)
     if total <= start:
         return 0
@@ -105,11 +112,10 @@ def find_best_ref_page(doc, start=2, end=15, min_width_pt=400):
 
     most_common_size = Counter(sizes).most_common(1)[0][0]
 
-    # 等宽模式下：仅校验宽度是否低于安全阈值
-    if most_common_size[0] < min_width_pt:
+    if most_common_size[0] < min_size_pt or most_common_size[1] < min_size_pt:
         log(
-            f"检测到频次最高宽度 {most_common_size[0]}pt "
-            f"低于安全阈值({min_width_pt}pt)，触发突变保护，退回首页",
+            f"检测到频次最高尺寸 {most_common_size} "
+            f"低于安全阈值({min_size_pt}pt)，触发突变保护，退回首页",
             Level.WARN,
         )
         return 0
@@ -123,28 +129,13 @@ def find_best_ref_page(doc, start=2, end=15, min_width_pt=400):
 
 
 def fix_pdf_scale_pro_module(
-    input_pdf_path, output_pdf_path, auto_ref=True, ref_page_index=None
-):
-    """全功能、可编程、工业级 PDF 统一宽度处理主函数
-
-    输出 PDF 为“流式等宽页面”：所有页面宽度与参考页保持完全一致，
-    高度根据原图比例动态调整（自适应缩放），而非固定尺寸画布。
-
-    :param input_pdf_path: 输入 PDF 路径
-    :param output_pdf_path: 输出 PDF 路径
-    :param auto_ref: True 时自动探测正文尺寸页；False 时使用 ref_page_index
-    :param ref_page_index: 手动指定的参考页索引（0-based），仅在 auto_ref=False 时生效
-    :return: 包含处理诊断信息的结构化字典，主要字段包括：
-        - output_path (str): 输出文件路径
-        - total_pages (int): 总页数
-        - ref_page_index (int): 实际使用的参考页索引（0-based）
-        - target_size_pt (tuple): 参考页基准尺寸 (width, height)
-        - target_width_pt (float): 统一后的目标宽度 (pt)
-        - toc_injected (bool): 是否成功注入书签
-        - toc_mode (str): 书签模式（"simple" / "full" / "None"）
-        - toc_count (int): 注入的书签数量
-        - toc_health_score (int): 书签健康度评分（0–100）
-    """
+    input_pdf_path: str,
+    output_pdf_path: str,
+    auto_ref: bool = True,
+    ref_page_index: int | None = None,
+    fit_width: bool = False,
+) -> dict:
+    """全功能、可编程、工业级 PDF 页面标准化处理主函数"""
     with (
         closing(fitz.open(input_pdf_path)) as src_doc,
         closing(fitz.open()) as dst_doc,
@@ -153,7 +144,6 @@ def fix_pdf_scale_pro_module(
         if total_pages == 0:
             raise ValueError("输入的 PDF 文件没有页面！")
 
-        # 路径完全解耦：自动探测 vs 手动指定
         if auto_ref:
             chosen_ref_index = find_best_ref_page(src_doc)
             log(
@@ -170,55 +160,78 @@ def fix_pdf_scale_pro_module(
             )
 
         ref_page = src_doc[chosen_ref_index]
-        ref_box = ref_page.rect
+        ref_box = ref_page.rect  # 使用 rect 替代 cropbox，防止带偏移导致错误裁剪
         target_w = ref_box.width
-        ref_h = ref_box.height
+        target_h = ref_box.height
 
-        log(
-            f"【画布目标】统一宽度: {target_w:.2f} pt（高度按原图比例动态自适应）",
-            Level.INFO,
-        )
+        if fit_width:
+            log(
+                f"【画布目标】模式: 按宽度适配 | 目标宽度: {target_w:.2f} pt（高度动态自适应）",
+                Level.INFO,
+            )
+        else:
+            log(
+                f"【画布目标】模式: 固定画布 | 基准尺寸: {target_w:.2f} x {target_h:.2f} pt",
+                Level.INFO,
+            )
 
-        # 页面标准化映射（统一宽度，高度等比自适应 + 安全保护）
+        # 页面标准化处理
+        # 逐页 new_page + show_pdf_page(clip=src_box)
+        # 配合 use_objstms + deflate + garbage=3 保存策略
+        # 实测：零偏移 + 输出体积小于原始文件
         for i, page in enumerate(src_doc):
             src_box = page.rect
             orig_w = src_box.width
             orig_h = src_box.height
 
-            # 防零除异常
-            if orig_w <= 0:
-                orig_w = target_w
+            if fit_width:
+                if orig_w <= 0:
+                    orig_w = target_w
 
-            # 根据目标宽度计算缩放比例
-            scale = target_w / orig_w
-            calculated_h = orig_h * scale
+                scale = target_w / orig_w
+                calculated_h = orig_h * scale
+                new_h = max(MIN_PAGE_HEIGHT, min(calculated_h, MAX_PAGE_HEIGHT))
 
-            # 施加高度安全边界防御
-            new_h = max(MIN_PAGE_HEIGHT, min(calculated_h, MAX_PAGE_HEIGHT))
+                if calculated_h > MAX_PAGE_HEIGHT or calculated_h < MIN_PAGE_HEIGHT:
+                    log(
+                        f"第 {i + 1} 页等比高度 ({calculated_h:.1f}pt) 触发安全限制，"
+                        f"修正为: {new_h:.1f}pt",
+                        Level.WARN,
+                    )
 
-            if calculated_h > MAX_PAGE_HEIGHT or calculated_h < MIN_PAGE_HEIGHT:
-                log(
-                    f"第 {i + 1} 页等比高度 ({calculated_h:.1f}pt) 触发安全限制，"
-                    f"修正为: {new_h:.1f}pt",
-                    Level.WARN,
-                )
+                new_page = dst_doc.new_page(width=target_w, height=new_h)
 
-            # 创建宽度为 target_w，高度动态自适应的新页面
-            new_page = dst_doc.new_page(width=target_w, height=new_h)
+                fit_rect = fitz.Rect(0, 0, target_w, new_h)
+                new_page.show_pdf_page(fit_rect, src_doc, i, clip=src_box)
 
-            fit_rect = fitz.Rect(0, 0, target_w, new_h)
-            new_page.show_pdf_page(fit_rect, src_doc, i, clip=src_box)
+                unified_box = fitz.Rect(0, 0, target_w, new_h)
+                new_page.set_mediabox(unified_box)
+            else:
+                new_page = dst_doc.new_page(width=target_w, height=target_h)
 
-            # 仅规范化 MediaBox，避免显式设置 CropBox 引发浮点数越界校验报错
-            unified_box = fitz.Rect(0, 0, target_w, new_h)
-            new_page.set_mediabox(unified_box)
+                scale_w = target_w / orig_w if orig_w > 0 else 1.0
+                scale_h = target_h / orig_h if orig_h > 0 else 1.0
+                s = min(scale_w, scale_h)
+
+                scaled_w = orig_w * s
+                scaled_h = orig_h * s
+
+                dx = (target_w - scaled_w) / 2.0
+                dy = (target_h - scaled_h) / 2.0
+
+                fit_rect = fitz.Rect(dx, dy, dx + scaled_w, dy + scaled_h)
+                new_page.show_pdf_page(fit_rect, src_doc, i, clip=src_box)
+
+                unified_box = fitz.Rect(0, 0, target_w, target_h)
+                new_page.set_mediabox(unified_box)
 
         # 书签识别与过滤
         log("开始书签树提取与健康度诊断", Level.INFO)
         threshold = 0.8 if STRICT_TOC else 0.6
+
         toc_to_use = None
         final_health_score = 0
-        used_mode = "None"
+        used_mode = "none"
 
         toc_simple = src_doc.get_toc(simple=True)
         health_score_simple, ratio_simple = calculate_toc_health(toc_simple)
@@ -228,8 +241,7 @@ def fix_pdf_scale_pro_module(
             final_health_score = health_score_simple
             used_mode = "simple"
             log(
-                f"【书签诊断】原生书签校验通过！健康度评分:"
-                f" {final_health_score}/100",
+                f"【书签诊断】原生书签校验通过！健康度评分: {final_health_score}/100",
                 Level.OK,
             )
         else:
@@ -241,8 +253,8 @@ def fix_pdf_scale_pro_module(
                 final_health_score = health_score_full
                 used_mode = "full"
                 log(
-                    "【书签诊断】完整模式 (simple=False) 恢复成功！健康度评分:"
-                    f" {final_health_score}/100",
+                    "【书签诊断】完整模式 (simple=False) 恢复成功！健康度评分: "
+                    f"{final_health_score}/100",
                     Level.OK,
                 )
             else:
@@ -265,6 +277,11 @@ def fix_pdf_scale_pro_module(
             dst_doc.set_toc(valid_toc)
             injected_count = len(valid_toc)
 
+        # 保存策略：
+        # use_objstms=True → 对象流压缩，匹配源 PDF 存储方式
+        # deflate=True       → 压缩未压缩流数据
+        # garbage=3          → 回收未用对象 + 去重 + 紧凑化（不重写内容流）
+        # 实测效果：输出体积小于原始文件，零页面偏移
         dst_doc.save(
             output_pdf_path,
             use_objstms=True,
@@ -277,8 +294,8 @@ def fix_pdf_scale_pro_module(
             "output_path": output_pdf_path,
             "total_pages": total_pages,
             "ref_page_index": chosen_ref_index,
-            "target_size_pt": (round(target_w, 2), round(ref_h, 2)),
-            "target_width_pt": round(target_w, 2),
+            "fit_width": fit_width,
+            "target_size_pt": (round(target_w, 2), round(target_h, 2)),
             "toc_injected": bool(injected_count > 0),
             "toc_mode": used_mode,
             "toc_count": injected_count,
@@ -291,45 +308,43 @@ def main():
     parser = argparse.ArgumentParser(
         prog="pdftoy.py",
         description=(
-            "PDF 页面尺寸统一工具 (PDF Page Size Unification Tool)\n"
-            "默认行为：以参考页宽度为基准，所有页按原比例等比缩放高度（流式页面）。"
+            "PDF 页面尺寸统一工具\n"
+            "【默认模式】: 固定参考页画布尺寸，将所有页面缩放居中。\n"
+            "【按宽模式】: 添加 -w / --fit-width 参数，统一页面宽度，高度等比例自适应。"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
-    # 位置参数（必选）
     parser.add_argument("input", help="输入 PDF 文件的路径")
     parser.add_argument(
         "-o",
         "--output",
-        help="输出 PDF 文件的路径（默认：在原文件名后加 _fixed.pdf）",
+        help="输出 PDF 文件路径（默认：自动添加 _fixed 后缀）",
         default=None,
     )
-
-    # 手动覆盖开关（可选）
+    parser.add_argument(
+        "-w",
+        "--fit-width",
+        action="store_true",
+        help="[核心开关] 启用按宽度适配模式（高度按比例自适应）。",
+    )
     parser.add_argument(
         "-p",
         "--page",
         type=int,
         metavar="PAGE_NUM",
-        help=(
-            "手动覆盖模式：指定参考页码（自然页码，从 1 开始计）。\n"
-            "若不提供此参数，默认自动探测频次最高的最优正文宽度页。"
-        ),
+        help="指定基准参考页码（从 1 开始计算，默认自动探测）",
     )
-
-    # 版本号输出
     parser.add_argument(
         "-V",
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
-        help="显示当前工具版本号",
+        help="显示工具当前版本",
     )
 
     args = parser.parse_args()
 
-    # 自动推导默认输出路径
     input_path = args.input
     if args.output:
         output_path = args.output
@@ -339,13 +354,12 @@ def main():
         else:
             output_path = input_path + "_fixed.pdf"
 
-    # 根据是否传入 -p/--page 决定模式与参数
     if args.page is not None:
         if args.page < 1:
             log("错误：指定的页码必须 >= 1", Level.ERROR)
             sys.exit(1)
         auto_ref = False
-        ref_index = args.page - 1  # 转为 0-based 索引
+        ref_index = args.page - 1
     else:
         auto_ref = True
         ref_index = None
@@ -356,6 +370,7 @@ def main():
             output_pdf_path=output_path,
             auto_ref=auto_ref,
             ref_page_index=ref_index,
+            fit_width=args.fit_width,
         )
     except Exception as e:
         log(f"{e}", Level.ERROR)
