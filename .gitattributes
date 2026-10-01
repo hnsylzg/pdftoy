@@ -1,0 +1,9 @@
+# 统一行尾：仓库内一律 LF，签出到 Windows 工作区转 CRLF
+* text=auto
+
+# 批处理必须是 CRLF，否则 cmd 解析会出问题
+*.bat text eol=crlf
+
+# 纯文本资源不参与 diff 噪音
+*.ico binary
+*.png binary

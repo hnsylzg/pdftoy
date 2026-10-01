@@ -1,0 +1,20 @@
+# 虚拟环境（编译用，不入库）
+.venv/
+venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# PyInstaller 产物与中间文件
+build/
+dist/
+*.spec
+*.tmp
+*.log
+
+# 系统 / 编辑器
+.DS_Store
+.vscode/
+.idea/
