@@ -8,22 +8,22 @@ try:
 except ImportError:
     import fitz  # PyMuPDF (legacy fallback for older versions)
 
-# =================== Global metadata & config flags ====================
+# ================= 全局元数据与配置开关 =================
 __version__ = "1.0.0"
 
-DEBUG_TOC = False  # True: dump the raw extracted bookmarks, handy for debugging odd PDFs
-STRICT_TOC = False  # True: enable strict mode, raising the bookmark detection threshold
+DEBUG_TOC = False  # True: 打印提取到的原始书签，方便调试奇葩 PDF
+STRICT_TOC = False  # True: 开启严格模式，提高书签判定门槛
 
-# Bookmark diagnostics & performance tuning constants
-EARLY_STOP_THRESHOLD = 0.85  # Top-quality preset: stop early once this share of the scanned sample is reached
+# 书签诊断与性能优化常量
+EARLY_STOP_THRESHOLD = 0.85  # 极高品质标准：已扫描样本达到此比例时直接触发提前终止
 
-# Height safety bounds (unit: pt; only enforced in fit_width mode)
-MIN_PAGE_HEIGHT = 100.0  # ~3.5 cm
-MAX_PAGE_HEIGHT = 5000.0  # ~1.76 m (guards against runaway memory use)
+# 高度安全边界保护（单位：pt，仅在 fit_width 为 True 时生效）
+MIN_PAGE_HEIGHT = 100.0  # 约 3.5 cm
+MAX_PAGE_HEIGHT = 5000.0  # 约 1.76 米（防御天量内存爆破）
 # =======================================================
 
 
-# =================== Logging system ====================
+# ================= 日志系统 =================
 class Level:
     INFO = "INFO"
     OK = "OK"
@@ -32,7 +32,7 @@ class Level:
     DEBUG = "DEBUG"
 
 
-# Log prefix: plain-text level name (fixed-width ASCII; no transcoding needed on any terminal)
+# 日志前缀：纯文字级别名（ASCII 定宽，UTF-8 / GBK 等任意终端都无需转码）
 LEVEL_STYLE = {
     Level.INFO: "INFO",
     Level.OK: "OK",
@@ -41,19 +41,19 @@ LEVEL_STYLE = {
     Level.DEBUG: "DEBUG",
 }
 
-# ANSI escape codes (control sequences only, never text content; safe in any encoding)
+# ANSI 转义码（仅控制序列，非文本内容，UTF-8 / GBK 等任意编码都安全）
 _ANSI_RESET = "\033[0m"
 _LEVEL_COLOR = {
-    Level.INFO: "\033[36m",   # cyan
-    Level.OK: "\033[32m",     # green
-    Level.WARN: "\033[33m",   # yellow
-    Level.ERROR: "\033[31m",  # red
-    Level.DEBUG: "\033[90m",  # gray
+    Level.INFO: "\033[36m",   # 青
+    Level.OK: "\033[32m",     # 绿
+    Level.WARN: "\033[33m",   # 黄
+    Level.ERROR: "\033[31m",  # 红
+    Level.DEBUG: "\033[90m",  # 灰
 }
 
 
 def _enable_ansi_on_windows():
-    """Old Windows consoles disable ANSI by default; enable VT processing to show colors"""
+    """Windows 旧版控制台默认关闭 ANSI，需开启虚拟终端处理才能显示颜色"""
     if os.name != "nt":
         return
     try:
@@ -70,13 +70,13 @@ def _enable_ansi_on_windows():
 
 
 def _color_supported():
-    """Whether colored output is on: interactive terminals only, honoring NO_COLOR / FORCE_COLOR"""
+    """是否应输出带色日志：仅交互式终端，且尊重 NO_COLOR / FORCE_COLOR 环境变量"""
     if os.environ.get("NO_COLOR"):
         return False
     if os.environ.get("FORCE_COLOR"):
         return True
     if not hasattr(sys.stdout, "isatty") or not sys.stdout.isatty():
-        return False  # disabled for pipes / file redirection, keeping the log file clean
+        return False  # 管道 / 文件重定向时关闭，避免污染日志文件
     if os.name == "nt":
         _enable_ansi_on_windows()
     return True
@@ -86,7 +86,7 @@ COLOR_ENABLED = _color_supported()
 
 
 def log(msg: str, level: str = Level.INFO):
-    """Unified log output: plain ASCII level prefix; colors applied on interactive terminals"""
+    """统一日志输出：前缀为纯文字级别名，ASCII 文本安全；交互终端自动按级别上色"""
     prefix = LEVEL_STYLE.get(level, f"[{level}]")
     if COLOR_ENABLED and level in _LEVEL_COLOR:
         print(f"{_LEVEL_COLOR[level]}{prefix}{_ANSI_RESET} {msg}")
@@ -98,7 +98,7 @@ def log(msg: str, level: str = Level.INFO):
 
 
 def calculate_toc_health(toc):
-    """Compute the bookmark health score (0 - 100) efficiently"""
+    """高效计算书签健康度得分 (0 - 100)"""
     total = len(toc)
     if total == 0:
         return 0, 0.0
@@ -145,7 +145,7 @@ def calculate_toc_health(toc):
 
 
 def find_best_ref_page(doc, start=2, end=15, min_size_pt=400):
-    """Pick the best reference page automatically"""
+    """自动选择最优参考页"""
     total = len(doc)
     if total <= start:
         return 0
@@ -164,8 +164,8 @@ def find_best_ref_page(doc, start=2, end=15, min_size_pt=400):
 
     if most_common_size[0] < min_size_pt or most_common_size[1] < min_size_pt:
         log(
-            f"Detected the most frequent size {most_common_size} "
-            f"below the safety threshold ({min_size_pt}pt) -- abrupt-change guard tripped, falling back to page 1",
+            f"检测到频次最高尺寸 {most_common_size} "
+            f"低于安全阈值({min_size_pt}pt)，触发突变保护，退回首页",
             Level.WARN,
         )
         return 0
@@ -179,16 +179,16 @@ def find_best_ref_page(doc, start=2, end=15, min_size_pt=400):
 
 
 # ============================================================
-# Two page-standardization implementations (per-page handling)
-#   method="matrix" : insert_pdf whole-doc copy + cm affine matrix wrapping of the content stream
-#   method="reflow" : per-page new_page + show_pdf_page(clip=...) re-render
-# Both give zero drift for raster / text PDFs (matrix additionally keeps hyperlinks)
+# 两种页面标准化实现（单页处理）
+#   method="matrix" : insert_pdf 整本复制 + cm 仿射矩阵包裹内容流
+#   method="reflow" : 逐页 new_page + show_pdf_page(clip=...) 重渲染
+# 两者均保证图片型 / 文字型 PDF 零飘移（matrix 额外保留超链接）
 # ============================================================
 
 def _compute_page_matrix(page, target_w, target_h, fit_width, page_index=None):
-    """Compute a single page's transform matrix and target height (pure math, no doc mutation)
+    """计算单页的变换矩阵与目标高度（纯计算，不修改文档）
 
-    Returns (fitz.Matrix, new_h). page_index identifies the page in logs.
+    返回 (fitz.Matrix, new_h)。page_index 用于日志中标识页码。
     """
     src_box = page.rect
     orig_w = src_box.width
@@ -203,10 +203,10 @@ def _compute_page_matrix(page, target_w, target_h, fit_width, page_index=None):
         new_h = max(MIN_PAGE_HEIGHT, min(calculated_h, MAX_PAGE_HEIGHT))
 
         if calculated_h > MAX_PAGE_HEIGHT or calculated_h < MIN_PAGE_HEIGHT:
-            idx_str = f"Page {page_index + 1}" if page_index is not None else "(some page)"
+            idx_str = f"第 {page_index + 1} 页" if page_index is not None else "某页"
             log(
-                f"{idx_str} scaled height ({calculated_h:.1f}pt) hit the safety limit,"
-                f"corrected to: {new_h:.1f}pt",
+                f"{idx_str}等比高度 ({calculated_h:.1f}pt) 触发安全限制，"
+                f"修正为: {new_h:.1f}pt",
                 Level.WARN,
             )
 
@@ -222,7 +222,7 @@ def _compute_page_matrix(page, target_w, target_h, fit_width, page_index=None):
         dy = (target_h - orig_h * s) / 2.0
         new_h = target_h
 
-    # A source page may carry a cropbox origin offset; it must be folded into the translation, otherwise the whole content drifts
+    # 源页面若存在 cropbox 原点偏移，必须计入平移量，否则内容会整体飘移
     cb = page.cropbox
     tx = dx - cb.x0 * s
     ty = dy - cb.y0 * s
@@ -231,12 +231,12 @@ def _compute_page_matrix(page, target_w, target_h, fit_width, page_index=None):
 
 
 def _rebuild_named_links(src_doc, dst_doc):
-    """Convert NAMED links to GOTO links and rebuild them into dst_doc
+    """将 NAMED 链接转为 GOTO 链接重建到 dst_doc
 
-    insert_pdf(links=True) does not copy NAMED-type link annotations -- they reference the PDF's
-    /Names dictionary, which insert_pdf never copies, so NAMED links get dropped.
-    This function reads links page by page from the source doc (get_links already resolves
-    NAMED to page+to) and re-inserts them as GOTO links into the destination doc.
+    insert_pdf(links=True) 不复制 NAMED 类型链接注释——这类链接引用 PDF 的
+    /Names 命名目标字典，而 insert_pdf 不会复制该字典，导致 NAMED 链接被丢弃。
+    此函数从源文档逐页读取链接（get_links 已将 NAMED 解析为 page+to），
+    以 GOTO 类型重新插入到目标文档，保留完整的目录超链接。
     """
     rebuilt = 0
     for i in range(len(src_doc)):
@@ -245,7 +245,7 @@ def _rebuild_named_links(src_doc, dst_doc):
         for link in src_links:
             if link.get("kind") != fitz.LINK_NAMED:
                 continue
-            # get_links() already resolved the target page and coordinates of NAMED links
+            # NAMED 链接的目标页和坐标已被 get_links() 解析
             target_page = link.get("page")
             if target_page is None or target_page < 0 or target_page >= len(dst_doc):
                 continue
@@ -261,12 +261,12 @@ def _rebuild_named_links(src_doc, dst_doc):
             dst_page.insert_link(new_link)
             rebuilt += 1
     if rebuilt:
-        log(f"Rebuilt {rebuilt} NAMED hyperlinks as GOTO type", Level.OK)
+        log(f"已重建 {rebuilt} 条 NAMED 超链接为 GOTO 类型", Level.OK)
     return rebuilt
 
 
 def _apply_matrix_page(dst_doc, page, i, target_w, target_h, fit_width, page_matrices=None):
-    """Matrix method: wrap page i of the fully insert_pdf'd doc with a cm matrix"""
+    """Matrix 方法：对已整本 insert_pdf 复制的第 i 页做 cm 矩阵包裹"""
     src_box = page.rect
     orig_w = src_box.width
     orig_h = src_box.height
@@ -278,8 +278,8 @@ def _apply_matrix_page(dst_doc, page, i, target_w, target_h, fit_width, page_mat
 
     new_page = dst_doc[i]
 
-    # Wrap the raw content stream with the cm (concat matrix) operator and clip to the source mediabox,
-    # exactly reproducing show_pdf_page(clip=page.rect) (no overflow / drift)
+    # 用 cm (concat matrix) 算子包裹原始内容流，并裁剪到源 mediabox，
+    # 精确复刻 show_pdf_page(clip=page.rect) 的渲染结果（防止溢出/飘移）
     old_content = new_page.read_contents()
     mat_cm = f"{m.a} {m.b} {m.c} {m.d} {m.e} {m.f} cm"
     clip_path = f"0 0 {orig_w} {orig_h} re W n"
@@ -293,33 +293,33 @@ def _apply_matrix_page(dst_doc, page, i, target_w, target_h, fit_width, page_mat
         + b"\nQ\n"
     )
 
-    # Every page MUST get its OWN content-stream xref; wrap only this page's private copy.
-    # Source PDFs often share one thin-shell content stream (e.g. q /fzFrm0 Do Q) across many pages.
-    # Updating that shared xref via update_stream would re-wrap it on later pages,
-    # nesting the cm matrix over and over (hundreds of levels in practice) and badly drifting the content.
+    # 必须为每一页分配[独立]的内容流 xref，只在本页私有副本上包裹一次。
+    # 源 PDF 常把「薄壳」内容流（如 q /fzFrm0 Do Q）在数百页间共享同一 xref。
+    # 若直接 update_stream 改写该共享 xref，后续页面会再次包裹，导致 cm 矩阵
+    # 被反复嵌套复合（实测可达数百层），内容严重飘移。
     new_xref = dst_doc.get_new_xref()
     dst_doc.update_object(new_xref, "<<>>")
     dst_doc.update_stream(new_xref, wrapped, compress=True)
     new_page.set_contents(new_xref)
 
-    # Unified canvas size (CropBox aligned too, so a source offset cannot clip or shift the visible area)
+    # 统一画布尺寸（同时对齐 CropBox，避免源 cropbox 偏移导致显示区域被裁剪/错位）
     unified_box = fitz.Rect(0, 0, target_w, new_h)
     new_page.set_mediabox(unified_box)
-    # Key: the cropbox must come from the WRITTEN mediabox, not the raw unified_box.
-    # set_mediabox rounds to a string, so the value read back into self.mediabox can differ
-    # slightly (~1e-5) from the full-precision unified_box when new_h (orig_h * s) differs;
-    # passing the raw unified_box to set_cropbox makes _set_pagebox compute
-    # rect.y0 = mb.y1 - ub.y1 as a tiny negative -> bogus "CropBox not in MediaBox"
-    # (fit-width only; a fixed canvas with new_h = target_h round-trips cleanly).
+    # 关键：cropbox 必须用「写入后的 mediabox」而非原始 unified_box。
+    # 因 set_mediabox 按字符串格式四舍五入存储，self.mediabox 读回值与
+    # full-precision 的 unified_box 在新高度(new_h 为 orig_h*s 计算值)场景下
+    # 可能存在 ~1e-5 差异，若用原始 unified_box 传 set_cropbox，_set_pagebox
+    # 内 rect.y0 = mb.y1 - ub.y1 会算出微小负值 -> 误报 "CropBox not in MediaBox"
+    # （fit-width 模式特有，固定画布 new_h=target_h 能干净往返故未暴露）。
     new_page.set_cropbox(new_page.mediabox)
 
-    # Transform hyperlink coordinates: a link rect is an independent annotation, so cm wrapping
-    # of the content stream does not move it -- the same matrix m must map every link rect
+    # 同步变换超链接坐标：链接矩形是独立注释对象，cm 包裹内容流不会带动它，
+    # 必须用同一矩阵 m 把每条链接的矩形（及文本链接的 QuadPoints）搬到新画布位置。
     for link in new_page.get_links():
         link_rect = fitz.Rect(link["from"])
         link["from"] = link_rect * m
-        # (and the QuadPoints of text links) onto the new canvas. The link destination ("to")
-        # scales with the same matrix, so an untransformed "to" lands off-target.
+        # 变换跳转目标点（"to"）：目标页的内容也被同一矩阵缩放了，
+        # 若不变换 to 坐标，点击链接跳转后定位会偏移。
         to_point = link.get("to")
         target_pg = link.get("page")
         if to_point is not None and target_pg is not None and page_matrices:
@@ -332,7 +332,7 @@ def _apply_matrix_page(dst_doc, page, i, target_w, target_h, fit_width, page_mat
 
 
 def _apply_reflow_page(dst_doc, src_doc, page, i, target_w, target_h, fit_width):
-    """Reflow method (legacy show_pdf_page): per-page new_page + show_pdf_page re-render"""
+    """Reflow 方法（旧版 show_pdf_page）：逐页 new_page + show_pdf_page 重渲染"""
     src_box = page.rect
     orig_w = src_box.width
     orig_h = src_box.height
@@ -347,8 +347,8 @@ def _apply_reflow_page(dst_doc, src_doc, page, i, target_w, target_h, fit_width)
 
         if calculated_h > MAX_PAGE_HEIGHT or calculated_h < MIN_PAGE_HEIGHT:
             log(
-                f"Page {i + 1} scaled height ({calculated_h:.1f}pt) hit the safety limit,"
-                f"corrected to: {new_h:.1f}pt",
+                f"第 {i + 1} 页等比高度 ({calculated_h:.1f}pt) 触发安全限制，"
+                f"修正为: {new_h:.1f}pt",
                 Level.WARN,
             )
 
@@ -386,14 +386,14 @@ def fix_pdf_scale_pro_module(
     fit_width: bool = False,
     method: str = "matrix",
 ) -> dict:
-    """Main entry: full-featured, programmable, industrial-grade PDF page standardization
+    """全功能、可编程、工业级 PDF 页面标准化处理主函数
 
     method:
-        "matrix" (default) -> insert_pdf whole-doc copy + cm matrix wrap; keeps text/images/vectors/hyperlinks
-        "reflow"        -> per-page new_page + show_pdf_page re-render (legacy method)
+        "matrix" (默认) -> insert_pdf 整本复制 + cm 矩阵包裹，保留文字/图片/矢量/超链接
+        "reflow"        -> 逐页 new_page + show_pdf_page 重渲染（旧版方法）
     """
     if method not in ("matrix", "reflow"):
-        raise ValueError(f"Unknown render method: {method!r} (expected 'matrix' or 'reflow')")
+        raise ValueError(f"未知的渲染方法: {method!r}（应为 'matrix' 或 'reflow'）")
 
     with (
         closing(fitz.open(input_pdf_path)) as src_doc,
@@ -401,12 +401,12 @@ def fix_pdf_scale_pro_module(
     ):
         total_pages = len(src_doc)
         if total_pages == 0:
-            raise ValueError("The input PDF has no pages!")
+            raise ValueError("输入的 PDF 文件没有页面！")
 
         if auto_ref:
             chosen_ref_index = find_best_ref_page(src_doc)
             log(
-                f"[Page analysis] Auto-detected the best reference page: {chosen_ref_index + 1}",
+                f"[页面分析] 自动探测最佳参考页: 第 {chosen_ref_index + 1} 页",
                 Level.INFO,
             )
         else:
@@ -414,34 +414,34 @@ def fix_pdf_scale_pro_module(
                 ref_page_index = 0
             chosen_ref_index = min(max(0, ref_page_index), total_pages - 1)
             log(
-                f"[Page analysis] Using the manually specified reference page: {chosen_ref_index + 1}",
+                f"[页面分析] 使用手动指定参考页: 第 {chosen_ref_index + 1} 页",
                 Level.INFO,
             )
 
         ref_page = src_doc[chosen_ref_index]
-        ref_box = ref_page.rect  # use rect instead of cropbox to avoid wrong cropping caused by offsets
+        ref_box = ref_page.rect  # 使用 rect 替代 cropbox，防止带偏移导致错误裁剪
         target_w = ref_box.width
         target_h = ref_box.height
 
         if fit_width:
             log(
-                f"[Canvas] Mode: fit width | target width: {target_w:.2f} pt (height adapts dynamically)",
+                f"[画布目标] 模式: 按宽度适配 | 目标宽度: {target_w:.2f} pt（高度动态自适应）",
                 Level.INFO,
             )
         else:
             log(
-                f"[Canvas] Mode: fixed canvas | base size: {target_w:.2f} x {target_h:.2f} pt",
+                f"[画布目标] 模式: 固定画布 | 基准尺寸: {target_w:.2f} x {target_h:.2f} pt",
                 Level.INFO,
             )
 
         log(
-            f"[Render method] {'matrix (recommended, keeps hyperlinks)' if method == 'matrix' else 'reflow legacy show_pdf_page'}",
+            f"[渲染方法] {'matrix 矩阵（推荐，保留超链接）' if method == 'matrix' else 'reflow 旧版 show_pdf_page'}",
             Level.INFO,
         )
 
-        # matrix: insert_pdf the whole book once (shared resources kept once, avoiding per-page
-        # duplication that would bloat the file / hang on large inputs), then wrap each page's
-        # content stream with a cm affine matrix for uniform scaling + centering.
+        # matrix 方法需整本一次性 insert_pdf（共享资源只存一份，避免逐页复制导致体积膨胀/卡死）
+        # 再逐页用 cm 仿射矩阵包裹内容流实现统一缩放+居中
+        # reflow 方法逐页 new_page + show_pdf_page，无需预复制
         page_matrices = None
         named_links_count = 0
         if method == "matrix":
@@ -449,27 +449,27 @@ def fix_pdf_scale_pro_module(
                 src_doc, annots=False, links=True, widgets=False,
             )
 
-            # reflow: per-page new_page + show_pdf_page, no pre-copy needed.
+            # 预计算所有页面的变换矩阵（供内容流包裹与链接 to 点坐标变换共用）
             page_matrices = [
                 _compute_page_matrix(page, target_w, target_h, fit_width, i)
                 for i, page in enumerate(src_doc)
             ]
 
-            # Precompute the transform for every page (shared by content-stream wrapping and "to" mapping)
-            # Rebuild NAMED links as GOTO links
-            # insert_pdf(links=True) does not copy NAMED links -- they reference the /Names named targets
-            # Update the NAMED links read from the source doc, re-inserting them as GOTO links.
+            # 重建 NAMED 链接为 GOTO 类型
+            # insert_pdf(links=True) 不复制 NAMED 链接——这类链接引用 /Names 命名目标
+            # 字典，而 insert_pdf 不会复制该字典，导致目录超链接全部丢失。
+            # 此处从源文档读取已解析的 NAMED 链接，以 GOTO 类型重新插入目标文档。
             named_links_count = _rebuild_named_links(src_doc, dst_doc)
 
-        # Standardize pages one by one
+        # 逐页标准化处理
         for i, page in enumerate(src_doc):
             if method == "matrix":
                 _apply_matrix_page(dst_doc, page, i, target_w, target_h, fit_width, page_matrices)
             else:
                 _apply_reflow_page(dst_doc, src_doc, page, i, target_w, target_h, fit_width)
 
-        # Bookmark identification & filtering
-        log("Start bookmark tree extraction and health check", Level.INFO)
+        # 书签识别与过滤
+        log("开始书签树提取与健康度诊断", Level.INFO)
         threshold = 0.8 if STRICT_TOC else 0.6
 
         toc_to_use = None
@@ -484,7 +484,7 @@ def fix_pdf_scale_pro_module(
             final_health_score = health_score_simple
             used_mode = "simple"
             log(
-                f"[Bookmark] Native bookmarks validated! Health score: {final_health_score}/100",
+                f"[书签诊断] 原生书签校验通过！健康度评分: {final_health_score}/100",
                 Level.OK,
             )
         else:
@@ -496,13 +496,13 @@ def fix_pdf_scale_pro_module(
                 final_health_score = health_score_full
                 used_mode = "full"
                 log(
-                    "[Bookmark] Full mode (simple=False) restored! Health score: "
+                    "[书签诊断] 完整模式 (simple=False) 恢复成功！健康度评分: "
                     f"{final_health_score}/100",
                     Level.OK,
                 )
             else:
                 log(
-                    "[Bookmark] No valid bookmarks found (TOC is empty or all entries are auto-generated placeholders); skipping bookmark restoration",
+                    "[书签诊断] 未检测到有效书签（目录为空或全部为自动生成的占位书签），本次跳过书签修复",
                     Level.WARN,
                 )
 
@@ -513,16 +513,16 @@ def fix_pdf_scale_pro_module(
 
             if filtered_count > 0:
                 log(
-                    f"[Bookmark] Auto-dropped {filtered_count} invalid bookmarks pointing to nonexistent pages",
+                    f"[书签诊断] 已自动剔除 {filtered_count} 条指向不存在页码的非法书签",
                     Level.WARN,
                 )
 
             dst_doc.set_toc(valid_toc)
             injected_count = len(valid_toc)
 
-        # Save strategy:
-        # matrix -> garbage=1 (whole-book insert_pdf already shares resources; drop unused objects only)
-        # reflow -> garbage=3 (per-page re-render; needs dedup + space compaction).
+        # 保存策略：
+        # matrix -> garbage=1（整本 insert_pdf 已共享资源，回收未用对象即可，避免大文件卡死）
+        # reflow -> garbage=3（逐页重渲染，需去重 + 紧凑化体积）
         garbage_level = 1 if method == "matrix" else 3
         dst_doc.save(
             output_pdf_path,
@@ -530,7 +530,7 @@ def fix_pdf_scale_pro_module(
             deflate=True,
             garbage=garbage_level,
         )
-        log(f"Processing complete. Saved to: {output_pdf_path}", Level.OK)
+        log(f"处理完成，文件成功保存至: {output_pdf_path}", Level.OK)
 
         return {
             "output_path": output_pdf_path,
@@ -548,50 +548,50 @@ def fix_pdf_scale_pro_module(
 
 
 def main():
-    """CLI entry-point configuration"""
+    """CLI 命令行入口配置"""
     parser = argparse.ArgumentParser(
-        prog="pdftoy.exe",
+        prog="pdftoy-zh.exe",
         description=(
-            "pdftoy -- PDF Page Size Unification Tool\n"
-            "[Default]: matrix method (insert_pdf + cm wrap; zero drift, keeps hyperlinks)\n"
-            "[Legacy]: pass -l / --legacy to use the show_pdf_page re-render method\n"
-            "[Canvas]: fixed reference-page canvas by default; -w fits the width (height scales)"
+            "pdftoy — PDF 页面尺寸统一工具\n"
+            "[默认模式]: matrix 矩阵方法（insert_pdf + cm 包裹，零飘移且保留超链接）\n"
+            "[旧版模式]: 加 -l / --legacy 使用 show_pdf_page 重渲染方法\n"
+            "[画布模式]: 默认固定参考页画布尺寸；加 -w 按宽度适配（高度等比例自适应）"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
-    parser.add_argument("input", help="Input PDF file path")
+    parser.add_argument("input", help="输入 PDF 文件的路径")
     parser.add_argument(
         "-o",
         "--output",
-        help="Output PDF file path (default: a _fixed suffix is appended)",
+        help="输出 PDF 文件路径（默认：自动添加 _fixed 后缀）",
         default=None,
     )
     parser.add_argument(
         "-w",
         "--fit-width",
         action="store_true",
-        help="[Core switch] Enable fit-to-width mode (height scales proportionally).",
+        help="[核心开关] 启用按宽度适配模式（高度按比例自适应）。",
     )
     parser.add_argument(
         "-p",
         "--page",
         type=int,
         metavar="PAGE_NUM",
-        help="Reference page number (1-based; auto-detected by default)",
+        help="指定基准参考页码（从 1 开始计算，默认自动探测）",
     )
     parser.add_argument(
         "-l",
         "--legacy",
         action="store_true",
-        help="Legacy show_pdf_page re-render (default: matrix, recommended).",
+        help="使用旧版 show_pdf_page 重渲染方法（默认：matrix 矩阵方法，推荐）。",
     )
     parser.add_argument(
         "-V",
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
-        help="Show the current version",
+        help="显示工具当前版本",
     )
 
     args = parser.parse_args()
@@ -607,7 +607,7 @@ def main():
 
     if args.page is not None:
         if args.page < 1:
-            log("Error: the specified page number must be >= 1", Level.ERROR)
+            log("错误：指定的页码必须 >= 1", Level.ERROR)
             sys.exit(1)
         auto_ref = False
         ref_index = args.page - 1
