@@ -9,7 +9,7 @@ except ImportError:
     import fitz  # PyMuPDF (legacy fallback for older versions)
 
 # =================== Global metadata & config flags ====================
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 DEBUG_TOC = False  # True: dump the raw extracted bookmarks, handy for debugging odd PDFs
 STRICT_TOC = False  # True: enable strict mode, raising the bookmark detection threshold

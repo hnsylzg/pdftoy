@@ -2,6 +2,8 @@
 
 统一 PDF **页面尺寸** 并智能修复 **书签（目录）** 的命令行与图形界面工具，基于 [PyMuPDF](https://pymupdf.readt.io/)。
 
+> **v1.1.0 为 Beta 测试版**：图形界面正在重构，功能仍在打磨，已知问题见文末。求稳请用 [v1.0.1](https://github.com/hnsylzg/pdftoy/releases/tag/v1.0.1)。
+
 ## 基本介绍
 
 默认把整本 PDF 的页面统一到同一画布尺寸并居中缩放；加 -w 则只统一宽度，高度按原图比例自适应。同时修好书签树：剔除指向不存在页码的非法书签，保留原生书签结构。
@@ -10,8 +12,9 @@
 - 也支持 `-p` 手动指定参考页码，跳过自动探测
 - 默认 matrix 方法（整本复制 + 矩阵包裹）保持零飘移并保留超链接；加 `-l` 可退回旧版 show_pdf_page 重渲染
 - 日志分五个级别（INFO / OK / WARN / ERROR / DEBUG），交互式终端带 ANSI 配色
-- 除命令行外还提供图形界面（GUI）：选文件、点按钮即可，零额外依赖
-  （tkinter 随 Python 标准库附带）；中文版入口为 `pdftoy_zh.py` / `pdftoy_gui_zh.py`
+- 除命令行外还提供图形界面（GUI）：选文件、点按钮即可，处理中显示进度条；
+  GUI 带参数启动时直接转命令行逻辑（`python pdftoy_gui.py 输入.pdf`）
+  （tkinter 随 Python 标准库附带，零额外依赖）；中文版入口为 `pdftoy_zh.py` / `pdftoy_gui_zh.py`
 
 ## 用法
 
@@ -23,6 +26,7 @@ python pdftoy.py 输入.pdf -w                # 按宽度适配，高度按原�
 python pdftoy.py 输入.pdf -l                # 旧版重渲染方法（默认 matrix）
 python pdftoy.py --version                  # 查看版本号
 python pdftoy_gui.py                        # 启动图形界面（中文版 pdftoy_gui_zh.py）
+python pdftoy_gui.py 输入.pdf -w            # GUI 带参数启动，直接走命令行逻辑
 ```
 
 不指定 `-o` 时，输出文件在原文件名后加 `_fixed.pdf`。
@@ -35,17 +39,16 @@ python pdftoy_gui.py                        # 启动图形界面（中文版 pdf
 | --- | --- | --- |
 | Python | 3.10+ | 推荐 3.12（源码用了 `X \| None` 注解） |
 | PyMuPDF | 1.24+ | `import pymupdf`；旧版用 `import fitz` 兼容 |
-| sv-ttk | 2.x | 仅图形界面需要（GUI 主题，1.0.1 引入）；只用命令行可以忽略 |
 
 ```bash
 python -m venv .venv
-.venv\Scripts\python -m pip install pymupdf sv-ttk
+.venv\Scripts\python -m pip install pymupdf
 ```
 
 ## 编译（打包成 exe）
 
 ```
-.venv\Scripts\python -m pip install pyinstaller pymupdf sv-ttk
+.venv\Scripts\python -m pip install pyinstaller pymupdf
 build.bat
 ```
 
@@ -56,4 +59,8 @@ build.bat
 ### UPX 压缩
 
 两个 bat 都带 `--upx-dir .venv\Scripts`，让 PyInstaller 从虚拟环境里找 `upx.exe`。UPX 正常工作时 exe 约 23 MB（CLI）／26 MB（GUI），比不压缩小 5～7 MB。
+
+## 已知问题（Beta）
+
+- 图形界面带参数启动转命令行时，日志不显示（计划 1.2.0 修复）
 
