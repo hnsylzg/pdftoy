@@ -1,3 +1,8 @@
 @echo off
 cd /d "%~dp0"
-".venv\Scripts\pythonw.exe" pdftoy_gui_zh.py
+REM Run in GUI mode (no console window). Running "pdftoy" without arguments launches the GUI.
+if exist ".venv\Scripts\pythonw.exe" (
+    ".venv\Scripts\pythonw.exe" pdftoy_zh.py
+) else (
+    ".venv\Scripts\python.exe" pdftoy_zh.py
+)
