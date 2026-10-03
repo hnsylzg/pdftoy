@@ -2,14 +2,14 @@
 
 统一 PDF **页面尺寸** 并智能修复 **书签（目录）** 的命令行与图形界面一体工具，基于 [PyMuPDF](https://pymupdf.readt.io/)。
 
-> **v1.2.0 为测试版**：本版把 CLI 与 GUI 合并进同一个文件——双击运行进图形界面（自动隐藏控制台），带参数运行走命令行。求稳请用 [v1.0.1](https://github.com/hnsylzg/pdftoy/releases/tag/v1.0.1)。
+> **v1.2.1 为测试版**：本版把 CLI 与 GUI 合并进同一个文件——双击运行进图形界面（windowed 打包，无控制台窗口），带参数运行走命令行。求稳请用 [v1.0.1](https://github.com/hnsylzg/pdftoy/releases/tag/v1.0.1)。
 
 ## 基本介绍
 
 默认把整本 PDF 的页面统一到同一画布尺寸并居中缩放；加 -w 则只统一宽度，高度按原图比例自适应。同时修好书签树：剔除指向不存在页码的非法书签，保留原生书签结构。
 
 - CLI 与 GUI 合并在一个文件：无参数运行启动图形界面；传入输入 PDF 路径则按命令行模式处理
-- exe 双击启动时自动隐藏控制台窗口（进程内 ShowWindow，无副作用）；从终端启动则保留控制台，正常输出日志
+- exe 为 windowed 打包：双击（无参数）进图形界面，本就没有控制台窗口；从终端带参数运行走命令行，日志自动回挂到原终端（不弹新窗口），退出时注入回车让提示符归位；拖拽 PDF 到 exe 则开一个日志窗口、结束即关
 - 参考页默认自动探测：扫描前若干页里频次最高的正文尺寸页；也支持 `-p` 手动指定参考页码，跳过自动探测
 - 默认 matrix 方法（整本复制 + 矩阵包裹）保持零飘移并保留超链接；加 `-l` 可退回旧版 show_pdf_page 重渲染
 - 日志分五个级别（INFO / OK / WARN / ERROR / DEBUG），交互式终端带 ANSI 配色
@@ -50,7 +50,7 @@ python -m venv .venv
 build.bat
 ```
 
-每个 bat 产出一个 exe：`build.bat` → `dist\pdftoy.exe`，`build_zh.bat` → `dist\pdftoy-zh.exe`（均为 console 打包——双击进图形界面自动隐藏窗口，终端里运行走命令行输出日志）。
+每个 bat 产出一个 exe：`build.bat` → `dist\pdftoy.exe`，`build_zh.bat` → `dist\pdftoy-zh.exe`（均为 **windowed 打包**：双击进图形界面无控制台窗口，从终端运行 CLI 日志回挂到原终端、正常输出）。
 `build.bat` 直接用虚拟环境里的 PyInstaller 打包，打包前会先清掉 `build/` 与 `dist/`。
 
 ### UPX 压缩

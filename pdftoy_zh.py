@@ -13,20 +13,21 @@ import sys
 from collections import Counter
 from contextlib import closing
 
-# ── 双击启动 GUI 时，在重导入之前尽快隐藏控制台黑窗，缩短可见闪烁 ──
-def _launched_from_terminal():
-    """判断本进程是否由终端外壳（cmd / powershell / Windows Terminal）启动。
+# ── windowed 打包下 CLI 模式的日志接回：挂回原终端，无终端时兜底 ──
+_attached_shell_name = ""  # AttachConsole 成功时记录外壳名，退出钩子据此决定是否注入回车
 
-    向上遍历进程树：若祖先进程中存在 cmd.exe / powershell.exe / pwsh.exe / wt.exe，
-    说明是从终端启动，此时不应隐藏控制台（避免把用户的终端窗口也藏掉）。
-    双击（由 explorer.exe 启动）的祖先链里没有这些外壳，返回 False。
 
-    说明：PyInstaller --onefile 的 bootloader 还会再拉起真正的 python 子进程，
-    所以控制台里实际上挂着 ≥2 个进程，不能用 GetConsoleProcessList 的计数判定。
-    这里改为基于进程树祖先的“外壳”判定，更可靠。
+def _find_shell_ancestor_pid():
+    """沿进程树向上找终端外壳祖先（cmd / powershell / pwsh / wt）。
+
+    返回 (PID, 外壳名)；找不到返回 (0, "")。
+
+    说明：PyInstaller --onefile 的 bootloader 会再拉起真正的 python 子进程，
+    ATTACH_PARENT_PROCESS 挂到的是没有控制台的 bootloader，因此必须显式找到
+    外壳祖先的 PID 再 AttachConsole(pid)。
     """
     if os.name != "nt":
-        return False
+        return 0, ""
     try:
         import ctypes
 
@@ -50,7 +51,7 @@ def _launched_from_terminal():
         shell_names = {"cmd.exe", "powershell.exe", "pwsh.exe", "wt.exe"}
         h = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
         if h == -1:
-            return False
+            return 0, ""
         entry = PROCESSENTRY32()
         entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
         parent_map = {}
@@ -68,39 +69,224 @@ def _launched_from_terminal():
             seen.add(pid)
             ppid, name = parent_map[pid]
             if name in shell_names:
-                return True
+                return pid, name
             pid = ppid
-        return False
+        return 0, ""
     except Exception:
-        # 快照/遍历失败：保守地认为“不是终端”（宁可显示黑窗，也不误藏终端）
+        # 快照/遍历失败：交由调用方走 AllocConsole 兜底
+        return 0, ""
+
+
+class _ConsoleWriter:
+    """WriteConsoleW 直写 Unicode 的极简文本流，不依赖控制台代码页，杜绝乱码。"""
+
+    def __init__(self, kernel32, handle):
+        import ctypes
+
+        self._ct = ctypes
+        self._write = kernel32.WriteConsoleW
+        self._write.argtypes = (
+            ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p,
+        )
+        self._handle = handle
+        self.vt_enabled = False  # VT 序列（擦行等）是否可用，由 _make_console_stream 设置
+
+    def write(self, text):
+        if text:
+            # WriteConsoleW 不做 LF→CRLF 翻译：裸 \n 只换行不回列，会让 shell
+            # 的提示符接在行中，需要按回车才归位。这里统一补成 \r\n。
+            if "\n" in text:
+                text = text.replace("\r\n", "\n").replace("\n", "\r\n")
+            written = self._ct.c_ulong(0)
+            self._write(self._handle, text, len(text), self._ct.byref(written), None)
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return True
+
+    def writable(self):
+        return True
+
+    def readable(self):
+        return False
+
+    def seekable(self):
+        return False
+
+    def close(self):
+        pass
+
+    @property
+    def closed(self):
+        return False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
         return False
 
 
-def _hide_own_console_if_gui():
-    """仅当双击（非终端）启动时才隐藏黑窗。在模块加载时调用，仅双击启动时才实际隐藏。
+def _make_console_stream():
+    """打开 CONOUT$ 并返回直写 Unicode 的输出流；失败返回 None。"""
+    import ctypes
 
-    通过进程树祖先判定是否来自终端外壳：来自终端则不隐藏（保留 CLI 日志窗口），
-    双击启动则 ShowWindow(SW_HIDE) 隐藏可见控制台窗口（进程仍附加，无副作用）。
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetStdHandle.argtypes = (ctypes.c_int, ctypes.c_void_p)
+    kernel32.SetStdHandle.restype = ctypes.c_int
+    kernel32.CreateFileW.argtypes = (
+        ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p,
+    )
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.SetConsoleMode.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+
+    # GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING
+    handle = kernel32.CreateFileW("CONOUT$", 0xC0000000, 3, None, 3, 0, None)
+    if not handle or handle == 0xFFFFFFFFFFFFFFFF:
+        return None
+    kernel32.SetConsoleMode.restype = ctypes.c_int
+    # 处理输出 | 行尾换行 | 虚拟终端(VT 颜色/擦行)；老系统不识别 VT 位会失败，退回无 VT 模式
+    if kernel32.SetConsoleMode(handle, 0x7):
+        vt = True
+    else:
+        kernel32.SetConsoleMode(handle, 0x3)
+        vt = False
+    kernel32.SetStdHandle(-11, handle)  # STD_OUTPUT_HANDLE
+    kernel32.SetStdHandle(-12, handle)  # STD_ERROR_HANDLE
+    stream = _ConsoleWriter(kernel32, handle)
+    stream.vt_enabled = vt
+    return stream
+
+
+def _ensure_cli_console():
+    """CLI 模式把日志接回终端（windowed 打包专用；源码在终端里跑时 sys.stdout 可用，直接跳过）。
+
+    1) stdout 已可用（重定向 > file，或源码在终端里跑）→ 不动；
+    2) 祖先里有终端外壳 → AttachConsole(其 PID)，日志打进原终端，不弹新窗；
+    3) 完全没有终端（拖拽 PDF 到 exe）→ AllocConsole 开一个日志窗口，进程退出即关。
+
+    输出走 WriteConsoleW 直写 Unicode，与控制台代码页无关，中文不乱码。
+    注意：cmd / PowerShell / WT 对 GUI 子系统 exe 都不等待、也不重绘提示符
+    （shell 只对共享自己控制台的 console 子系统程序等待；windowed exe 不共享，
+    见 SO 1305257）。对策：退出时向原终端的输入缓冲注入一对回车键事件，
+    shell 收到立即重画提示符（_inject_enter_for_shell）。
     """
-    if os.name != "nt":
-        return
-    if _launched_from_terminal():
+    global _attached_shell_name
+    if os.name != "nt" or sys.stdout is not None:
         return
     try:
         import ctypes
 
         kernel32 = ctypes.windll.kernel32
-        user32 = ctypes.windll.user32
-        hwnd = kernel32.GetConsoleWindow()
-        if hwnd:
-            user32.ShowWindow(hwnd, 0)  # SW_HIDE = 0
+        pid, shell_name = _find_shell_ancestor_pid()
+        if pid:
+            if not kernel32.AttachConsole(pid):
+                pid = 0
+                kernel32.AllocConsole()
+        else:
+            kernel32.AllocConsole()
+        _attached_shell_name = shell_name if pid else ""
+        stream = _make_console_stream()
+        if stream is None:
+            return
+        sys.stdout = stream
+        sys.stderr = stream
+        if _attached_shell_name:
+            # shell 启动本进程后已画完新提示符（光标停在其后）。
+            # 支持 VT：回行首并整行擦除该提示符，日志从干净行首开始，
+            # 退出时注入的回车会让 shell 重新画提示符。
+            # 不支持 VT：只回行首（罕见，老系统）。
+            stream.write("\r\x1b[2K" if stream.vt_enabled else "\r")
+    except Exception:
+        return
+    # 接回后重估颜色开关。本函数会在 _color_supported 定义之前（模块早期）被调用，
+    # 那时先跳过——模块后面的 COLOR_ENABLED = _color_supported() 会用接回后的流重新求值。
+    if "_color_supported" in globals():
+        global COLOR_ENABLED
+        COLOR_ENABLED = _color_supported()
+    # shell（cmd/PS/WT）都不等待 GUI 子系统进程退出：注册退出钩子，替用户“按一下回车”。
+    if _attached_shell_name:
+        import atexit
+
+        atexit.register(_inject_enter_for_shell)
+
+
+def _inject_enter_for_shell():
+    """向控制台输入缓冲注入一对回车键事件，让 shell 立即重画提示符。
+
+    背景：windowed exe 经 AttachConsole 挂回终端后，shell（cmd/PowerShell/WT
+    表现一致）早在启动瞬间就画完提示符且不等待我们退出（SO 1305257）。
+    注入 VK_RETURN 键事件（WriteConsoleInputW 写 CONIN$）等效于用户敲一下
+    回车，shell 即刻归位。写 down+up 一对事件，更接近真实按键。
+    仅在 AttachConsole 成功（挂回了真实终端）时才注入。
+    """
+    if not _attached_shell_name:
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        # INPUT_RECORD: EventType=KEY_EVENT(1) + KEY_EVENT_RECORD(16 字节)
+        class _KEY_EVENT_RECORD(ctypes.Structure):
+            _fields_ = [
+                ("bKeyDown", ctypes.c_int),
+                ("wRepeatCount", ctypes.c_ushort),
+                ("wVirtualKeyCode", ctypes.c_ushort),
+                ("wVirtualScanCode", ctypes.c_ushort),
+                ("uChar", ctypes.c_wchar),
+                ("dwControlKeyState", ctypes.c_ulong),
+            ]
+
+        class _INPUT_RECORD(ctypes.Structure):
+            class _Event(ctypes.Union):
+                _fields_ = [("KeyEvent", _KEY_EVENT_RECORD)]
+
+            _fields_ = [("EventType", ctypes.c_ushort), ("Event", _Event)]
+
+        # 打开 CONIN$（要读写权限才能 WriteConsoleInputW）
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        h = kernel32.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+        if not h or h == 0xFFFFFFFFFFFFFFFF:
+            return
+        try:
+            records = (_INPUT_RECORD * 2)()
+            # 按下
+            down = records[0]
+            down.EventType = 1  # KEY_EVENT
+            ev = down.Event.KeyEvent
+            ev.bKeyDown = 1
+            ev.wRepeatCount = 1
+            ev.wVirtualKeyCode = 0x0D  # VK_RETURN
+            ev.wVirtualScanCode = 0x1C
+            ev.uChar = "\r"
+            # 松开
+            up = records[1]
+            up.EventType = 1
+            ev = up.Event.KeyEvent
+            ev.bKeyDown = 0
+            ev.wRepeatCount = 1
+            ev.wVirtualKeyCode = 0x0D
+            ev.wVirtualScanCode = 0x1C
+            ev.uChar = "\r"
+            written = ctypes.c_ulong(0)
+            kernel32.WriteConsoleInputW(
+                h, ctypes.byref(records[0]), 2, ctypes.byref(written)
+            )
+        finally:
+            kernel32.CloseHandle(h)
     except Exception:
         pass
 
 
-# 模块加载即判断：双击 → 立即隐藏黑窗；终端启动 → 不动（保留 CLI 日志窗口）。
-# 放在 pymupdf / tkinter 等重导入之前，使黑窗在解压后几乎瞬间消失。
-_hide_own_console_if_gui()
+# windowed 打包：带参数运行即 CLI，赶在 pymupdf / tkinter 重导入之前挂回终端；
+# 双击 GUI（无参数）不受影响。
+if os.name == "nt" and len(sys.argv) > 1:
+    _ensure_cli_console()
 
 try:
     import pymupdf as fitz  # PyMuPDF (pymupdf is the canonical name since 1.24+)
@@ -121,7 +307,7 @@ except ImportError:
     _TK_AVAILABLE = False
 
 # ================= 全局元数据与配置开关 =================
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 DEBUG_TOC = False  # True: 打印提取到的原始书签，方便调试奇葩 PDF
 STRICT_TOC = False  # True: 开启严格模式，提高书签判定门槛
@@ -133,7 +319,6 @@ EARLY_STOP_THRESHOLD = 0.85  # 极高品质标准：已扫描样本达到此比�
 MIN_PAGE_HEIGHT = 100.0  # 约 3.5 cm
 MAX_PAGE_HEIGHT = 5000.0  # 约 1.76 米（防御天量内存爆破）
 # =======================================================
-
 
 # ================= 日志系统 =================
 class Level:
@@ -661,6 +846,10 @@ def fix_pdf_scale_pro_module(
 
 def main():
     """统一入口：未提供输入文件则启动图形界面；提供输入 PDF 路径则进入命令行处理。"""
+    # windowed 打包下，带参数运行即 CLI：先把日志接回终端（双击 GUI 无参数，不受影响）
+    if len(sys.argv) > 1:
+        _ensure_cli_console()
+
     parser = argparse.ArgumentParser(
         prog="pdftoy",
         description=(
@@ -717,7 +906,7 @@ def main():
 
     # 模式判定：未提供输入文件 → 图形界面；否则命令行处理
     if args.input is None:
-        # 黑窗已在模块加载时（重导入之前）由 _hide_own_console_if_gui() 尽早隐藏
+        # windowed 打包：GUI 模式本就没有控制台窗口，无需任何隐藏处理
         launch_gui()
         return
 

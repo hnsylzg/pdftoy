@@ -13,24 +13,21 @@ import sys
 from collections import Counter
 from contextlib import closing
 
-# ── When launched via double-click into the GUI, hide the console window as early as possible (before heavy imports) to minimize visible flicker ──
-def _launched_from_terminal():
-    """Check whether this process was launched from a terminal shell
-    (cmd / powershell / Windows Terminal).
+# ── Reattach CLI logs to the terminal under a windowed build (re-attach to the parent shell; fall back when no terminal) ──
+_attached_shell_name = ""  # Records the shell name when AttachConsole succeeds; the exit hook uses it to decide whether to inject Enter
 
-    Walk up the process tree: if any ancestor is cmd.exe / powershell.exe /
-    pwsh.exe / wt.exe, we were started from a terminal and must not hide
-    the console (that would hide the user's own terminal window too).
-    Double-click launches (parented by explorer.exe) have none of these
-    shells in the ancestor chain, so return False.
 
-    Note: PyInstaller's --onefile bootloader re-spawns the real python child
-    process, so >=2 processes are attached to the console -- counting via
-    GetConsoleProcessList is unreliable. Ancestor-based shell detection is
-    more robust.
+def _find_shell_ancestor_pid():
+    """Walk the process tree upward to find the terminal-shell ancestor (cmd / powershell / pwsh / wt).
+
+    Returns (PID, shell_name); returns (0, "") if not found.
+
+    Note: PyInstaller's --onefile bootloader re-spawns the real python child process,
+    so ATTACH_PARENT_PROCESS attaches to the console-less bootloader. We must explicitly
+    locate the shell ancestor's PID and AttachConsole(pid) to it.
     """
     if os.name != "nt":
-        return False
+        return 0, ""
     try:
         import ctypes
 
@@ -54,7 +51,7 @@ def _launched_from_terminal():
         shell_names = {"cmd.exe", "powershell.exe", "pwsh.exe", "wt.exe"}
         h = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
         if h == -1:
-            return False
+            return 0, ""
         entry = PROCESSENTRY32()
         entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
         parent_map = {}
@@ -72,43 +69,224 @@ def _launched_from_terminal():
             seen.add(pid)
             ppid, name = parent_map[pid]
             if name in shell_names:
-                return True
+                return pid, name
             pid = ppid
-        return False
+        return 0, ""
     except Exception:
-        # Snapshot/walk failure: conservatively assume "not a terminal" (better to show a console than hide the user's terminal)
+        # Snapshot/walk failed: let the caller fall back to AllocConsole
+        return 0, ""
+
+
+class _ConsoleWriter:
+    """Minimal text stream that writes Unicode directly via WriteConsoleW, independent of the console codepage (no mojibake)."""
+
+    def __init__(self, kernel32, handle):
+        import ctypes
+
+        self._ct = ctypes
+        self._write = kernel32.WriteConsoleW
+        self._write.argtypes = (
+            ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p,
+        )
+        self._handle = handle
+        self.vt_enabled = False  # Whether VT sequences (line erase, etc.) are available; set by _make_console_stream
+
+    def write(self, text):
+        if text:
+            # WriteConsoleW does not translate LF -> CRLF: a bare \n only moves to the next line without
+            # returning to column 0, leaving the shell prompt mid-line until Enter is pressed. Normalize to \r\n.
+            if "\n" in text:
+                text = text.replace("\r\n", "\n").replace("\n", "\r\n")
+            written = self._ct.c_ulong(0)
+            self._write(self._handle, text, len(text), self._ct.byref(written), None)
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return True
+
+    def writable(self):
+        return True
+
+    def readable(self):
+        return False
+
+    def seekable(self):
+        return False
+
+    def close(self):
+        pass
+
+    @property
+    def closed(self):
+        return False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
         return False
 
 
-def _hide_own_console_if_gui():
-    """Hide the console window only when launched by double-click (not from a terminal).
+def _make_console_stream():
+    """Open CONOUT$ and return a direct Unicode output stream; returns None on failure."""
+    import ctypes
 
-    Called at module load; it only hides on a double-click launch.
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetStdHandle.argtypes = (ctypes.c_int, ctypes.c_void_p)
+    kernel32.SetStdHandle.restype = ctypes.c_int
+    kernel32.CreateFileW.argtypes = (
+        ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p,
+    )
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.SetConsoleMode.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
 
-    The process-tree ancestor check tells a terminal launch apart (console
-    kept so CLI logs stay visible); on a double-click launch,
-    ShowWindow(SW_HIDE) hides the visible console window (the process stays
-    attached, no side effects).
+    # GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING
+    handle = kernel32.CreateFileW("CONOUT$", 0xC0000000, 3, None, 3, 0, None)
+    if not handle or handle == 0xFFFFFFFFFFFFFFFF:
+        return None
+    kernel32.SetConsoleMode.restype = ctypes.c_int
+    # Process output | line-end translation | virtual terminal (VT color / line erase); old systems reject the VT bit and fall back to non-VT mode
+    if kernel32.SetConsoleMode(handle, 0x7):
+        vt = True
+    else:
+        kernel32.SetConsoleMode(handle, 0x3)
+        vt = False
+    kernel32.SetStdHandle(-11, handle)  # STD_OUTPUT_HANDLE
+    kernel32.SetStdHandle(-12, handle)  # STD_ERROR_HANDLE
+    stream = _ConsoleWriter(kernel32, handle)
+    stream.vt_enabled = vt
+    return stream
+
+
+def _ensure_cli_console():
+    """Reattach CLI logs to the terminal (windowed build only; skipped when running from source where sys.stdout works).
+
+    1) stdout already usable (redirected > file, or running from source in a terminal) -> leave it alone;
+    2) a terminal shell in the ancestors -> AttachConsole(its PID); logs go to the original terminal, no new window;
+    3) no terminal at all (PDF dragged onto the exe) -> AllocConsole opens a log window, closed when the process exits.
+
+    Output goes through WriteConsoleW writing Unicode directly, independent of the console codepage (no Chinese mojibake).
+    Note: cmd / PowerShell / WT do not wait for, nor redraw the prompt after, a GUI-subsystem exe
+    (shells only wait for console-subsystem programs that share their console; the windowed exe does not share,
+    see SO 1305257). Fix: on exit, inject a pair of Enter key events into the original terminal's input buffer,
+    so the shell immediately redraws its prompt (_inject_enter_for_shell).
     """
-    if os.name != "nt":
-        return
-    if _launched_from_terminal():
+    global _attached_shell_name
+    if os.name != "nt" or sys.stdout is not None:
         return
     try:
         import ctypes
 
         kernel32 = ctypes.windll.kernel32
-        user32 = ctypes.windll.user32
-        hwnd = kernel32.GetConsoleWindow()
-        if hwnd:
-            user32.ShowWindow(hwnd, 0)  # SW_HIDE = 0
+        pid, shell_name = _find_shell_ancestor_pid()
+        if pid:
+            if not kernel32.AttachConsole(pid):
+                pid = 0
+                kernel32.AllocConsole()
+        else:
+            kernel32.AllocConsole()
+        _attached_shell_name = shell_name if pid else ""
+        stream = _make_console_stream()
+        if stream is None:
+            return
+        sys.stdout = stream
+        sys.stderr = stream
+        if _attached_shell_name:
+            # The shell already drew its new prompt after launching this process (cursor sits right after it).
+            # With VT: return to line start and erase the whole prompt line, so logs start on a clean line;
+            # the Enter injected on exit makes the shell redraw its prompt.
+            # Without VT: only return to line start (rare, old systems).
+            stream.write("\r\x1b[2K" if stream.vt_enabled else "\r")
+    except Exception:
+        return
+    # Re-evaluate the color switch after reattaching. This runs before _color_supported is defined (early at module load),
+    # so skip then -- the later COLOR_ENABLED = _color_supported() re-evaluates against the reattached stream.
+    if "_color_supported" in globals():
+        global COLOR_ENABLED
+        COLOR_ENABLED = _color_supported()
+    # Shells (cmd/PS/WT) do not wait for the GUI-subsystem process to exit: register an exit hook that presses Enter for the user.
+    if _attached_shell_name:
+        import atexit
+
+        atexit.register(_inject_enter_for_shell)
+
+
+def _inject_enter_for_shell():
+    """Inject a pair of Enter key events into the console input buffer so the shell redraws its prompt immediately.
+
+    Background: after a windowed exe re-attaches to the terminal via AttachConsole, the shell (cmd/PowerShell/WT
+    behave the same) drew its prompt at launch and does not wait for us to exit (SO 1305257).
+    Injecting a VK_RETURN key event (WriteConsoleInputW writes CONIN$) is equivalent to the user pressing Enter,
+    so the shell returns to its prompt at once. We write a down+up pair of events to mimic a real key press.
+    Only injected when AttachConsole succeeded (a real terminal was re-attached).
+    """
+    if not _attached_shell_name:
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        # INPUT_RECORD: EventType=KEY_EVENT(1) + KEY_EVENT_RECORD(16 bytes)
+        class _KEY_EVENT_RECORD(ctypes.Structure):
+            _fields_ = [
+                ("bKeyDown", ctypes.c_int),
+                ("wRepeatCount", ctypes.c_ushort),
+                ("wVirtualKeyCode", ctypes.c_ushort),
+                ("wVirtualScanCode", ctypes.c_ushort),
+                ("uChar", ctypes.c_wchar),
+                ("dwControlKeyState", ctypes.c_ulong),
+            ]
+
+        class _INPUT_RECORD(ctypes.Structure):
+            class _Event(ctypes.Union):
+                _fields_ = [("KeyEvent", _KEY_EVENT_RECORD)]
+
+            _fields_ = [("EventType", ctypes.c_ushort), ("Event", _Event)]
+
+        # Open CONIN$ (needs read+write access for WriteConsoleInputW)
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        h = kernel32.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+        if not h or h == 0xFFFFFFFFFFFFFFFF:
+            return
+        try:
+            records = (_INPUT_RECORD * 2)()
+            # key down
+            down = records[0]
+            down.EventType = 1  # KEY_EVENT
+            ev = down.Event.KeyEvent
+            ev.bKeyDown = 1
+            ev.wRepeatCount = 1
+            ev.wVirtualKeyCode = 0x0D  # VK_RETURN
+            ev.wVirtualScanCode = 0x1C
+            ev.uChar = "\r"
+            # key up
+            up = records[1]
+            up.EventType = 1
+            ev = up.Event.KeyEvent
+            ev.bKeyDown = 0
+            ev.wRepeatCount = 1
+            ev.wVirtualKeyCode = 0x0D
+            ev.wVirtualScanCode = 0x1C
+            ev.uChar = "\r"
+            written = ctypes.c_ulong(0)
+            kernel32.WriteConsoleInputW(
+                h, ctypes.byref(records[0]), 2, ctypes.byref(written)
+            )
+        finally:
+            kernel32.CloseHandle(h)
     except Exception:
         pass
 
 
-# Decide at module load: double-click -> hide the console immediately; terminal launch -> leave it (keep the CLI log window).
-# Placed before heavy imports like pymupdf / tkinter so the console disappears almost instantly after extraction.
-_hide_own_console_if_gui()
+# windowed build: running with args means CLI -- reattach the terminal before pymupdf / tkinter is imported;
+# double-click GUI (no args) is unaffected.
+if os.name == "nt" and len(sys.argv) > 1:
+    _ensure_cli_console()
 
 try:
     import pymupdf as fitz  # PyMuPDF (pymupdf is the canonical name since 1.24+)
@@ -129,7 +307,7 @@ except ImportError:
     _TK_AVAILABLE = False
 
 # ================= Global metadata & config flags =================
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 DEBUG_TOC = False  # True: dump the raw extracted bookmarks, handy for debugging odd PDFs
 STRICT_TOC = False  # True: enable strict mode, raising the bookmark detection threshold
@@ -435,11 +613,11 @@ def _apply_matrix_page(dst_doc, page, i, target_w, target_h, fit_width, page_mat
 
     # Transform hyperlink coordinates: a link rect is an independent annotation, so cm wrapping
     # of the content stream does not move it -- the same matrix m must map every link rect
+    # (and the QuadPoints of text links) onto the new canvas. The link destination ("to")
+    # scales with the same matrix, so an untransformed "to" lands off-target.
     for link in new_page.get_links():
         link_rect = fitz.Rect(link["from"])
         link["from"] = link_rect * m
-        # (and the QuadPoints of text links) onto the new canvas. The link destination ("to")
-        # scales with the same matrix, so an untransformed "to" lands off-target.
         to_point = link.get("to")
         target_pg = link.get("page")
         if to_point is not None and target_pg is not None and page_matrices:
@@ -562,6 +740,7 @@ def fix_pdf_scale_pro_module(
         # matrix: insert_pdf the whole book once (shared resources kept once, avoiding per-page
         # duplication that would bloat the file / hang on large inputs), then wrap each page's
         # content stream with a cm affine matrix for uniform scaling + centering.
+        # reflow: per-page new_page + show_pdf_page, no pre-copy needed.
         page_matrices = None
         named_links_count = 0
         if method == "matrix":
@@ -669,6 +848,10 @@ def fix_pdf_scale_pro_module(
 
 def main():
     """Single entry point: no input file launches the GUI; an input PDF path switches to command-line mode."""
+    # windowed build: running with args means CLI -- reattach logs to the terminal first (double-click GUI has no args, unaffected)
+    if len(sys.argv) > 1:
+        _ensure_cli_console()
+
     parser = argparse.ArgumentParser(
         prog="pdftoy",
         description=(
@@ -725,7 +908,7 @@ def main():
 
     # Mode decision: no input file -> GUI; otherwise command-line processing
     if args.input is None:
-        # The console window was already hidden as early as possible at module load (before heavy imports) by _hide_own_console_if_gui().
+        # windowed build: GUI mode has no console window, so no hiding is needed
         launch_gui()
         return
 
@@ -963,7 +1146,7 @@ class App:
         # Progress bar (shown while processing)
         self.progress = ttk.Progressbar(self.root, mode="indeterminate")
 
-        # Processing log (scrollable, shown while processing)
+        # ---------- Processing log ----------
         log_frame = ttk.LabelFrame(self.root, text="Processing log", padding=4)
         log_frame.pack(fill="both", expand=True, padx=20, pady=(6, 6))
 
@@ -1238,7 +1421,6 @@ class App:
                 subprocess.Popen(["open", folder])
             else:
                 subprocess.Popen(["xdg-open", folder])
-
 
 
 
